@@ -139,8 +139,10 @@ pub enum HnswError {
     ErrorHnswData(String),
 }
 
-/// The journal that `save_with_journal` keeps in the folder of an index while it writes the files.
-pub const PERSIST_JOURNAL_FILE: &str = "persist_journal.bin";
+/// The journal that `save_with_journal` keeps in the folder of an index while it writes the files: the name of
+/// hnswlib/hnswalg.h, no longer than data_level0.bin, the longest file of an index, so that the journal fits within
+/// MAX_PATH on Windows wherever the index does.
+pub const PERSIST_JOURNAL_FILE: &str = "journal.bin";
 
 /// What `apply_persist_journal` found in the folder of an index.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1217,6 +1219,13 @@ pub mod test {
         let index = persistence_fixture(dir.path(), HnswDistanceFunction::Euclidean);
         assert!(!dir.path().join(PERSIST_JOURNAL_FILE).exists());
         drop(index);
+    }
+
+    // On Windows the files of an index are opened without long paths: the journal fits within MAX_PATH wherever
+    // data_level0.bin, the longest name of the four files, does.
+    #[test]
+    fn persistence_journal_name_is_no_longer_than_the_files_of_an_index() {
+        assert!(PERSIST_JOURNAL_FILE.len() <= "data_level0.bin".len());
     }
 
     #[test]

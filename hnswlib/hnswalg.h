@@ -180,8 +180,9 @@ namespace hnswlib
     // writes the bytes of the journal again at load. The layout: the magic and the version, then records of a file (an
     // index in PERSIST_JOURNAL_FILES), an offset, a size and the bytes, then the number of records and the FNV-1a 64 of
     // every byte before it. A journal without a valid end was cut while it was written, before persistDirty touched
-    // any file: it is removed without being applied.
-    const char PERSIST_JOURNAL_FILE[] = "persist_journal.bin";
+    // any file: it is removed without being applied. Its name is no longer than data_level0.bin: on Windows the files
+    // are opened without long paths, so a folder that holds data_level0.bin within MAX_PATH holds the journal too.
+    const char PERSIST_JOURNAL_FILE[] = "journal.bin";
     const char PERSIST_JOURNAL_MAGIC[8] = {'H', 'N', 'S', 'W', 'J', 'R', 'N', 'L'};
     const uint32_t PERSIST_JOURNAL_VERSION = 1;
     const char *const PERSIST_JOURNAL_FILES[4] = {"header.bin", "data_level0.bin", "length.bin", "link_lists.bin"};
