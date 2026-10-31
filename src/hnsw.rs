@@ -54,6 +54,10 @@ extern "C" {
     );
 
     fn persist_dirty(index: *const HnswIndexPtrFFI);
+    fn persist_dirty_with_journal(index: *const HnswIndexPtrFFI);
+    fn write_persist_journal(index: *const HnswIndexPtrFFI);
+    #[link_name = "apply_persist_journal"]
+    fn apply_persist_journal_ffi(path: *const c_char) -> c_int;
 
     fn add_item(index: *const HnswIndexPtrFFI, data: *const f32, id: usize, replace_deleted: bool);
     fn mark_deleted(index: *const HnswIndexPtrFFI, id: usize);
@@ -133,6 +137,36 @@ pub enum HnswError {
     ErrorStringRead(#[from] Utf8Error),
     #[error("HnswDataError: `{0}`")]
     ErrorHnswData(String),
+}
+
+/// The journal that `save_with_journal` keeps in the folder of an index while it writes the files.
+pub const PERSIST_JOURNAL_FILE: &str = "persist_journal.bin";
+
+/// What `apply_persist_journal` found in the folder of an index.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PersistJournal {
+    /// No journal: the last save ended, or none was made with a journal.
+    None,
+    /// A complete journal: a save was cut after it, and its bytes were written again to the files.
+    Applied,
+    /// A journal cut while it was written, before the save touched the files: removed.
+    Discarded,
+}
+
+/// Before the files of the index in `path` are read: the journal of a save that was cut, if any, written again to
+/// them, so that they are all of one checkpoint.
+pub fn apply_persist_journal(path: &std::path::Path) -> Result<PersistJournal, HnswInitError> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| HnswInitError::InvalidPath("Invalid UTF-8 path".to_string()))?;
+    let path = CString::new(path).map_err(|e| HnswInitError::InvalidPath(e.to_string()))?;
+    let outcome = unsafe { apply_persist_journal_ffi(path.as_ptr()) };
+    read_and_return_hnsw_error(std::ptr::null())?;
+    Ok(match outcome {
+        1 => PersistJournal::Applied,
+        2 => PersistJournal::Discarded,
+        _ => PersistJournal::None,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -382,6 +416,22 @@ impl HnswIndex {
 
     pub fn save(&self) -> Result<(), HnswError> {
         unsafe { persist_dirty(self.ffi_ptr) };
+        read_and_return_hnsw_error(self.ffi_ptr)?;
+        Ok(())
+    }
+
+    /// `save` with a journal: the bytes it writes go first to a journal, synced, and the files are synced before the
+    /// journal is removed, so that a kill in the middle leaves files that `apply_persist_journal` makes whole again.
+    pub fn save_with_journal(&self) -> Result<(), HnswError> {
+        unsafe { persist_dirty_with_journal(self.ffi_ptr) };
+        read_and_return_hnsw_error(self.ffi_ptr)?;
+        Ok(())
+    }
+
+    /// The first step of `save_with_journal` alone: the journal of what a save would write now, the files untouched.
+    /// For tests and tools that need a save cut after its journal.
+    pub fn write_persist_journal(&self) -> Result<(), HnswError> {
+        unsafe { write_persist_journal(self.ffi_ptr) };
         read_and_return_hnsw_error(self.ffi_ptr)?;
         Ok(())
     }
@@ -990,6 +1040,183 @@ pub mod test {
         drop(index);
         let loaded = reload_persistence_fixture(dir.path(), HnswDistanceFunction::Euclidean);
         assert_eq!(loaded.get(1).unwrap().unwrap(), vec![2.0; 3]);
+    }
+
+    const INDEX_FILES: [&str; 4] = [
+        "header.bin",
+        "data_level0.bin",
+        "length.bin",
+        "link_lists.bin",
+    ];
+
+    fn index_files(path: &std::path::Path) -> Vec<Vec<u8>> {
+        INDEX_FILES
+            .iter()
+            .map(|name| std::fs::read(path.join(name)).unwrap())
+            .collect()
+    }
+
+    fn journal_vector(id: usize, round: usize) -> [f32; 3] {
+        [id as f32, (id * 7 % 11) as f32, round as f32]
+    }
+
+    // A persistent index with the records 1..=30, saved with a journal; then, in memory only, a resize, 90 records more
+    // and 10 of the first ones updated, so that a save writes new elements, changed ones and their neighbors.
+    fn journal_fixture(path: &std::path::Path) -> HnswIndex {
+        let mut index = persistence_fixture(path, HnswDistanceFunction::Euclidean);
+        for id in 1..=30 {
+            index.add(id, &journal_vector(id, 0)).unwrap();
+        }
+        index.save_with_journal().unwrap();
+        index.resize(200).unwrap();
+        for id in 31..=120 {
+            index.add(id, &journal_vector(id, 0)).unwrap();
+        }
+        for id in 1..=10 {
+            index.add(id, &journal_vector(id, 1)).unwrap();
+        }
+        index
+    }
+
+    fn assert_journal_fixture_saved(path: &std::path::Path) {
+        let loaded = reload_persistence_fixture(path, HnswDistanceFunction::Euclidean);
+        assert_eq!(loaded.len(), 120);
+        for id in 1..=120 {
+            let round = if id <= 10 { 1 } else { 0 };
+            assert_eq!(
+                loaded.get(id).unwrap().unwrap(),
+                journal_vector(id, round).to_vec()
+            );
+        }
+    }
+
+    #[test]
+    fn persistence_journal_is_removed_after_its_save() {
+        let dir = tempdir().unwrap();
+        let index = journal_fixture(dir.path());
+        index.save_with_journal().unwrap();
+        assert!(!dir.path().join(PERSIST_JOURNAL_FILE).exists());
+        index.close_fd();
+        drop(index);
+        assert_eq!(
+            apply_persist_journal(dir.path()).unwrap(),
+            PersistJournal::None
+        );
+        assert_journal_fixture_saved(dir.path());
+    }
+
+    // A save of the index cut by a kill after header.bin: the header of the new checkpoint, the other files of the old
+    // one. The journal must give the files of the whole save.
+    fn assert_journal_mends_a_save_cut_after_its_header(path: &std::path::Path, index: HnswIndex) {
+        let old = index_files(path);
+        index.write_persist_journal().unwrap();
+        index.save().unwrap();
+        let new = index_files(path);
+        index.close_fd();
+        drop(index);
+        for (name, bytes) in INDEX_FILES.iter().zip(&old).skip(1) {
+            std::fs::write(path.join(name), bytes).unwrap();
+        }
+        assert_ne!(index_files(path), new);
+        assert_eq!(
+            apply_persist_journal(path).unwrap(),
+            PersistJournal::Applied
+        );
+        assert_eq!(index_files(path), new);
+        assert!(!path.join(PERSIST_JOURNAL_FILE).exists());
+    }
+
+    #[test]
+    fn persistence_journal_mends_a_save_cut_after_its_header() {
+        let dir = tempdir().unwrap();
+        let index = journal_fixture(dir.path());
+        assert_journal_mends_a_save_cut_after_its_header(dir.path(), index);
+        assert_journal_fixture_saved(dir.path());
+    }
+
+    // New elements far from the saved ones: the save writes them and few others, after elements it leaves as they are,
+    // whose link lists come before theirs in link_lists.bin.
+    #[test]
+    fn persistence_journal_mends_a_save_after_clean_elements() {
+        let dir = tempdir().unwrap();
+        let index = persistence_fixture(dir.path(), HnswDistanceFunction::Euclidean);
+        for id in 1..=60 {
+            index.add(id, &journal_vector(id, 0)).unwrap();
+        }
+        index.save_with_journal().unwrap();
+        for id in 61..=70 {
+            index.add(id, &[1000.0 + id as f32, 0.0, 0.0]).unwrap();
+        }
+        assert_journal_mends_a_save_cut_after_its_header(dir.path(), index);
+        let loaded = reload_persistence_fixture(dir.path(), HnswDistanceFunction::Euclidean);
+        assert_eq!(loaded.len(), 70);
+        assert_eq!(loaded.get(70).unwrap().unwrap(), vec![1070.0, 0.0, 0.0]);
+    }
+
+    // A kill while a journal is applied leaves it, to be applied again at the next load.
+    #[test]
+    fn persistence_journal_applied_twice_gives_the_same_files() {
+        let dir = tempdir().unwrap();
+        let index = journal_fixture(dir.path());
+        let old = index_files(dir.path());
+        index.write_persist_journal().unwrap();
+        index.save().unwrap();
+        let new = index_files(dir.path());
+        index.close_fd();
+        drop(index);
+        let journal = std::fs::read(dir.path().join(PERSIST_JOURNAL_FILE)).unwrap();
+        for (name, bytes) in INDEX_FILES.iter().zip(&old) {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        for _ in 0..2 {
+            std::fs::write(dir.path().join(PERSIST_JOURNAL_FILE), &journal).unwrap();
+            assert_eq!(
+                apply_persist_journal(dir.path()).unwrap(),
+                PersistJournal::Applied
+            );
+            assert_eq!(index_files(dir.path()), new);
+        }
+        assert_journal_fixture_saved(dir.path());
+    }
+
+    // A journal cut or damaged while it was written: the save had not touched the files yet.
+    #[test]
+    fn persistence_journal_cut_while_written_is_removed_and_not_applied() {
+        let dir = tempdir().unwrap();
+        let index = journal_fixture(dir.path());
+        let old = index_files(dir.path());
+        index.write_persist_journal().unwrap();
+        index.close_fd();
+        drop(index);
+        let journal = std::fs::read(dir.path().join(PERSIST_JOURNAL_FILE)).unwrap();
+        let mut damaged = journal.clone();
+        damaged[journal.len() / 2] ^= 1;
+        let cuts = [
+            journal[..journal.len() - 1].to_vec(),
+            journal[..journal.len() - 16].to_vec(),
+            journal[..journal.len() / 2].to_vec(),
+            journal[..12].to_vec(),
+            Vec::new(),
+            damaged,
+        ];
+        for cut in cuts {
+            std::fs::write(dir.path().join(PERSIST_JOURNAL_FILE), &cut).unwrap();
+            assert_eq!(
+                apply_persist_journal(dir.path()).unwrap(),
+                PersistJournal::Discarded
+            );
+            assert_eq!(index_files(dir.path()), old);
+            assert!(!dir.path().join(PERSIST_JOURNAL_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn persistence_new_index_removes_a_journal_left_in_its_folder() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(PERSIST_JOURNAL_FILE), b"left").unwrap();
+        let index = persistence_fixture(dir.path(), HnswDistanceFunction::Euclidean);
+        assert!(!dir.path().join(PERSIST_JOURNAL_FILE).exists());
+        drop(index);
     }
 
     #[test]

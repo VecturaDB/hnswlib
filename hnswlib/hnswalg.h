@@ -15,6 +15,19 @@
 #include <set>
 #include <climits>
 #include <cstring>
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <fstream>
+#include <sstream>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace hnswlib
 {
@@ -160,6 +173,292 @@ namespace hnswlib
     typedef unsigned int tableint;
     typedef unsigned int linklistsizeint;
     const int PERSISTENCE_VERSION = 1; // Used by persistent indices to check if the index on disk is compatible with the code
+
+    // The journal of a save (persistDirtyWithJournal): the bytes that persistDirty writes, each with its file and
+    // offset, written and synced before persistDirty starts, removed once the four files are synced. persistDirty
+    // writes the files in place, so a kill in the middle of it leaves files of two checkpoints; applyPersistJournal
+    // writes the bytes of the journal again at load. The layout: the magic and the version, then records of a file (an
+    // index in PERSIST_JOURNAL_FILES), an offset, a size and the bytes, then the number of records and the FNV-1a 64 of
+    // every byte before it. A journal without a valid end was cut while it was written, before persistDirty touched
+    // any file: it is removed without being applied.
+    const char PERSIST_JOURNAL_FILE[] = "persist_journal.bin";
+    const char PERSIST_JOURNAL_MAGIC[8] = {'H', 'N', 'S', 'W', 'J', 'R', 'N', 'L'};
+    const uint32_t PERSIST_JOURNAL_VERSION = 1;
+    const char *const PERSIST_JOURNAL_FILES[4] = {"header.bin", "data_level0.bin", "length.bin", "link_lists.bin"};
+    const uint8_t PERSIST_JOURNAL_HEADER = 0;
+    const uint8_t PERSIST_JOURNAL_DATA_LEVEL0 = 1;
+    const uint8_t PERSIST_JOURNAL_LENGTH = 2;
+    const uint8_t PERSIST_JOURNAL_LINK_LISTS = 3;
+    const size_t PERSIST_JOURNAL_PIECE = 1 << 20;
+
+    enum class PersistJournalOutcome
+    {
+        None = 0,      // no journal
+        Applied = 1,   // a complete journal, written again to the files
+        Discarded = 2, // an incomplete journal, removed
+    };
+
+    class Fnv1a64
+    {
+    public:
+        void update(const char *data, size_t size)
+        {
+            for (size_t i = 0; i < size; i++)
+                hash_ = (hash_ ^ (unsigned char)data[i]) * 1099511628211ULL;
+        }
+
+        uint64_t value() const { return hash_; }
+
+    private:
+        uint64_t hash_ = 14695981039346656037ULL;
+    };
+
+    // Makes the writes to a file durable: the files of an index are written through streams, which cannot sync.
+    inline void syncPersistedFile(const std::string &path)
+    {
+#ifdef _WIN32
+        int fd = _open(path.c_str(), _O_RDWR | _O_BINARY);
+        if (fd < 0)
+            throw std::runtime_error("Cannot open file to sync: " + path);
+        int result = _commit(fd);
+        _close(fd);
+#else
+        int fd = open(path.c_str(), O_RDWR);
+        if (fd < 0)
+            throw std::runtime_error("Cannot open file to sync: " + path);
+        int result = fsync(fd);
+        close(fd);
+#endif
+        if (result != 0)
+            throw std::runtime_error("Cannot sync file: " + path);
+    }
+
+    // Makes a file created or removed in a directory durable. Windows has no sync of a directory.
+    inline void syncPersistDirectory(const std::string &path)
+    {
+#ifdef _WIN32
+        (void)path;
+#else
+        int fd = open(path.c_str(), O_RDONLY);
+        if (fd < 0)
+            throw std::runtime_error("Cannot open directory to sync: " + path);
+        int result = fsync(fd);
+        close(fd);
+        if (result != 0)
+            throw std::runtime_error("Cannot sync directory: " + path);
+#endif
+    }
+
+    inline void removePersistJournal(const std::string &location)
+    {
+        std::string path = location + "/" + PERSIST_JOURNAL_FILE;
+        if (std::remove(path.c_str()) != 0)
+        {
+            if (errno == ENOENT)
+                return;
+            throw std::runtime_error("Cannot remove journal: " + path);
+        }
+        syncPersistDirectory(location);
+    }
+
+    // Writes a journal through stdio, which can sync it, with the FNV-1a 64 of what it writes.
+    class PersistJournalWriter
+    {
+    public:
+        explicit PersistJournalWriter(const std::string &path) : path_(path)
+        {
+            file_ = std::fopen(path.c_str(), "wb");
+            if (file_ == nullptr)
+                throw std::runtime_error("Cannot open journal: " + path);
+            write(PERSIST_JOURNAL_MAGIC, sizeof(PERSIST_JOURNAL_MAGIC));
+            writePOD(PERSIST_JOURNAL_VERSION);
+        }
+
+        ~PersistJournalWriter()
+        {
+            if (file_ != nullptr)
+                std::fclose(file_);
+        }
+
+        // The head of a record; its size bytes follow with write.
+        void record(uint8_t file, uint64_t offset, uint64_t size)
+        {
+            writePOD(file);
+            writePOD(offset);
+            writePOD(size);
+            records_++;
+        }
+
+        void write(const char *data, size_t size)
+        {
+            if (size != 0 && std::fwrite(data, 1, size, file_) != size)
+                throw std::runtime_error("Cannot write journal: " + path_);
+            hash_.update(data, size);
+        }
+
+        template <typename T>
+        void writePOD(const T &value)
+        {
+            write((const char *)&value, sizeof(T));
+        }
+
+        // The end of the journal, then its bytes made durable.
+        void finish()
+        {
+            writePOD(records_);
+            uint64_t hash = hash_.value();
+            write((const char *)&hash, sizeof(hash));
+            if (std::fflush(file_) != 0)
+                throw std::runtime_error("Cannot write journal: " + path_);
+#ifdef _WIN32
+            int synced = _commit(_fileno(file_));
+#else
+            int synced = fsync(fileno(file_));
+#endif
+            int closed = std::fclose(file_);
+            file_ = nullptr;
+            if (synced != 0 || closed != 0)
+                throw std::runtime_error("Cannot sync journal: " + path_);
+        }
+
+    private:
+        std::string path_;
+        std::FILE *file_ = nullptr;
+        Fnv1a64 hash_;
+        uint64_t records_ = 0;
+    };
+
+    // Bytes of a journal, read and added to its hash; false at its end.
+    inline bool readPersistJournal(std::istream &input, char *data, size_t size, Fnv1a64 &hash)
+    {
+        input.read(data, size);
+        if ((size_t)input.gcount() != size)
+            return false;
+        hash.update(data, size);
+        return true;
+    }
+
+    // Whether a journal of size bytes is complete: records up to an end with their number and the FNV-1a 64 of every
+    // byte before it.
+    inline bool persistJournalComplete(std::istream &input, uint64_t size)
+    {
+        const uint64_t head = sizeof(PERSIST_JOURNAL_MAGIC) + sizeof(uint32_t);
+        const uint64_t record_head = sizeof(uint8_t) + 2 * sizeof(uint64_t);
+        const uint64_t end = 2 * sizeof(uint64_t);
+        if (size < head + end)
+            return false;
+        Fnv1a64 hash;
+        char magic[sizeof(PERSIST_JOURNAL_MAGIC)];
+        uint32_t version;
+        if (!readPersistJournal(input, magic, sizeof(magic), hash) ||
+            std::memcmp(magic, PERSIST_JOURNAL_MAGIC, sizeof(magic)) != 0 ||
+            !readPersistJournal(input, (char *)&version, sizeof(version), hash) || version != PERSIST_JOURNAL_VERSION)
+            return false;
+        std::vector<char> piece(PERSIST_JOURNAL_PIECE);
+        uint64_t position = head;
+        uint64_t records = 0;
+        while (position < size - end)
+        {
+            uint8_t file;
+            uint64_t offset;
+            uint64_t length;
+            if (size - end - position < record_head ||
+                !readPersistJournal(input, (char *)&file, sizeof(file), hash) ||
+                !readPersistJournal(input, (char *)&offset, sizeof(offset), hash) ||
+                !readPersistJournal(input, (char *)&length, sizeof(length), hash))
+                return false;
+            position += record_head;
+            if (file > PERSIST_JOURNAL_LINK_LISTS || length > size - end - position)
+                return false;
+            for (uint64_t left = length; left > 0;)
+            {
+                size_t bytes = (size_t)std::min<uint64_t>(left, piece.size());
+                if (!readPersistJournal(input, piece.data(), bytes, hash))
+                    return false;
+                left -= bytes;
+            }
+            position += length;
+            records++;
+        }
+        uint64_t count;
+        if (!readPersistJournal(input, (char *)&count, sizeof(count), hash))
+            return false;
+        uint64_t expected = hash.value();
+        uint64_t stored;
+        input.read((char *)&stored, sizeof(stored));
+        return (size_t)input.gcount() == sizeof(stored) && count == records && stored == expected;
+    }
+
+    // At load, before the files of the index in location are read: a complete journal written again to them, which
+    // are then synced, and removed; an incomplete one only removed. Writing the bytes again is harmless, so a kill
+    // while a journal is applied leaves it to be applied at the next load.
+    inline PersistJournalOutcome applyPersistJournal(const std::string &location)
+    {
+        std::string path = location + "/" + PERSIST_JOURNAL_FILE;
+        struct stat status;
+        if (stat(path.c_str(), &status) != 0)
+        {
+            if (errno == ENOENT)
+                return PersistJournalOutcome::None;
+            throw std::runtime_error("Cannot read journal: " + path);
+        }
+        std::ifstream input(path, std::ios::binary);
+        if (!input.is_open())
+            throw std::runtime_error("Cannot open journal: " + path);
+        input.seekg(0, std::ios::end);
+        uint64_t size = (uint64_t)input.tellg();
+        input.seekg(0, std::ios::beg);
+        if (!persistJournalComplete(input, size))
+        {
+            input.close();
+            removePersistJournal(location);
+            return PersistJournalOutcome::Discarded;
+        }
+
+        input.clear();
+        input.seekg(sizeof(PERSIST_JOURNAL_MAGIC) + sizeof(uint32_t), std::ios::beg);
+        std::fstream outputs[4];
+        for (int i = 0; i < 4; i++)
+        {
+            outputs[i].open(location + "/" + PERSIST_JOURNAL_FILES[i], std::ios::in | std::ios::out | std::ios::binary);
+            if (!outputs[i].is_open())
+                throw std::runtime_error("Cannot open file: " + location + "/" + PERSIST_JOURNAL_FILES[i]);
+        }
+        std::vector<char> piece(PERSIST_JOURNAL_PIECE);
+        uint64_t position = sizeof(PERSIST_JOURNAL_MAGIC) + sizeof(uint32_t);
+        while (position < size - 2 * sizeof(uint64_t))
+        {
+            uint8_t file;
+            uint64_t offset;
+            uint64_t length;
+            readBinaryPOD(input, file);
+            readBinaryPOD(input, offset);
+            readBinaryPOD(input, length);
+            outputs[file].seekp(offset, std::ios::beg);
+            for (uint64_t left = length; left > 0;)
+            {
+                size_t bytes = (size_t)std::min<uint64_t>(left, piece.size());
+                input.read(piece.data(), bytes);
+                outputs[file].write(piece.data(), bytes);
+                left -= bytes;
+            }
+            position += sizeof(file) + sizeof(offset) + sizeof(length) + length;
+        }
+        bool written = input.good();
+        for (int i = 0; i < 4; i++)
+        {
+            outputs[i].flush();
+            written = written && outputs[i].good();
+            outputs[i].close();
+        }
+        input.close();
+        if (!written)
+            throw std::runtime_error("Cannot apply journal: " + path);
+        for (int i = 0; i < 4; i++)
+            syncPersistedFile(location + "/" + PERSIST_JOURNAL_FILES[i]);
+        removePersistJournal(location);
+        return PersistJournalOutcome::Applied;
+    }
 
     template <typename dist_t>
     class HierarchicalNSW : public AlgorithmInterface<dist_t>
@@ -1047,6 +1346,9 @@ namespace hnswlib
                 throw std::runtime_error("initPersistentIndex called for an index that is not set to persist on write");
             }
 
+            // A journal left in the folder belongs to the files of an index that was there before.
+            removePersistJournal(persist_location_);
+
             // Create the file handles for initial write
             std::ofstream output_header(this->getHeaderLocation(), std::ios::binary);
             std::ofstream output_data_level0(this->getDataLevel0Location(), std::ios::binary);
@@ -1160,6 +1462,104 @@ namespace hnswlib
             }
             // Durability (fsync) is the caller's responsibility.
             elements_to_persist_.clear();
+        }
+
+        std::string getPersistJournalLocation()
+        {
+            return persist_location_ + "/" + PERSIST_JOURNAL_FILE;
+        }
+
+        // The first step of persistDirtyWithJournal: the journal of the bytes that persistDirty would write now, synced.
+        // Alone it leaves the files as they are, for tests and tools.
+        void writePersistJournal()
+        {
+            if (!persist_on_write_)
+            {
+                throw std::runtime_error("writePersistJournal called for an index that is not set to persist on write");
+            }
+
+            if (!_persist_file_handles_opened)
+            {
+                throw std::runtime_error("writePersistJournal called for an index that has not opened its file handles");
+            }
+
+            PersistJournalWriter journal(getPersistJournalLocation());
+            std::ostringstream header;
+            persistHeader(header);
+            std::string header_bytes = header.str();
+            journal.record(PERSIST_JOURNAL_HEADER, 0, header_bytes.size());
+            journal.write(header_bytes.data(), header_bytes.size());
+
+            // Runs of consecutive dirty elements, [first, last), which lie one after the other in each file.
+            std::vector<std::pair<size_t, size_t>> runs;
+            for (const auto &id : elements_to_persist_)
+            {
+                if (!runs.empty() && runs.back().second == id)
+                    runs.back().second = id + 1;
+                else
+                    runs.emplace_back(id, id + 1);
+            }
+            for (const auto &run : runs)
+            {
+                size_t bytes = (run.second - run.first) * size_data_per_element_;
+                journal.record(PERSIST_JOURNAL_DATA_LEVEL0, (uint64_t)run.first * size_data_per_element_, bytes);
+                journal.write(data_level0_memory_ + run.first * size_data_per_element_, bytes);
+            }
+            for (const auto &run : runs)
+            {
+                size_t bytes = (run.second - run.first) * sizeof(float);
+                journal.record(PERSIST_JOURNAL_LENGTH, (uint64_t)run.first * sizeof(float), bytes);
+                journal.write(length_memory_ + run.first * sizeof(float), bytes);
+            }
+
+            // A link list has no fixed size: an element lies after the lists of all the elements before it, as
+            // persistDirty walks them.
+            auto linkListSize = [this](size_t i) -> unsigned int {
+                return element_levels_[i] > 0 ? size_links_per_element_ * element_levels_[i] : 0;
+            };
+            uint64_t offset = 0;
+            size_t i = 0;
+            for (const auto &run : runs)
+            {
+                if (run.first >= cur_element_count)
+                    break;
+                for (; i < run.first; i++)
+                    offset += sizeof(unsigned int) + linkListSize(i);
+                size_t last = std::min<size_t>(run.second, cur_element_count);
+                uint64_t bytes = 0;
+                for (size_t j = run.first; j < last; j++)
+                    bytes += sizeof(unsigned int) + linkListSize(j);
+                journal.record(PERSIST_JOURNAL_LINK_LISTS, offset, bytes);
+                for (; i < last; i++)
+                {
+                    unsigned int size = linkListSize(i);
+                    journal.writePOD(size);
+                    if (size)
+                        journal.write(linkLists_[i], size);
+                }
+                offset += bytes;
+            }
+            journal.finish();
+            syncPersistDirectory(persist_location_);
+        }
+
+        // persistDirty with a journal: the journal of the dirty elements written and synced first, then persistDirty,
+        // then the four files synced and the journal removed. A kill in the middle leaves the journal, which
+        // applyPersistJournal writes again to the files at load.
+        void persistDirtyWithJournal()
+        {
+            if (elements_to_persist_.size() == 0)
+            {
+                return;
+            }
+
+            writePersistJournal();
+            persistDirty();
+            syncPersistedFile(getHeaderLocation());
+            syncPersistedFile(getDataLevel0Location());
+            syncPersistedFile(getLengthLocation());
+            syncPersistedFile(getLinkListLocation());
+            removePersistJournal(persist_location_);
         }
 
         constexpr size_t calculateHeaderSize() const {

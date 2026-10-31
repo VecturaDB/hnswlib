@@ -134,6 +134,24 @@ public:
     appr_alg->persistDirty();
   }
 
+  void persist_dirty_with_journal()
+  {
+    if (!index_inited)
+    {
+      throw std::runtime_error("Index not inited");
+    }
+    appr_alg->persistDirtyWithJournal();
+  }
+
+  void write_persist_journal()
+  {
+    if (!index_inited)
+    {
+      throw std::runtime_error("Index not inited");
+    }
+    appr_alg->writePersistJournal();
+  }
+
   void add_item(const data_t *data, const hnswlib::labeltype id, const bool replace_deleted = false)
   {
     if (!index_inited)
@@ -341,6 +359,54 @@ extern "C"
       return;
     }
     last_error.clear();
+  }
+
+  // Can throw std::exception
+  void persist_dirty_with_journal(Index<float> *index)
+  {
+    try
+    {
+      index->persist_dirty_with_journal();
+    }
+    catch (std::exception &e)
+    {
+      last_error = e.what();
+      return;
+    }
+    last_error.clear();
+  }
+
+  // Can throw std::exception
+  void write_persist_journal(Index<float> *index)
+  {
+    try
+    {
+      index->write_persist_journal();
+    }
+    catch (std::exception &e)
+    {
+      last_error = e.what();
+      return;
+    }
+    last_error.clear();
+  }
+
+  // Can throw std::exception. Needs no index: it runs before the files of one are read. Returns a
+  // hnswlib::PersistJournalOutcome, or -1 with the error in last_error.
+  int apply_persist_journal(const char *path)
+  {
+    int outcome;
+    try
+    {
+      outcome = (int)hnswlib::applyPersistJournal(path);
+    }
+    catch (std::exception &e)
+    {
+      last_error = e.what();
+      return -1;
+    }
+    last_error.clear();
+    return outcome;
   }
 
   // Can throw std::exception
