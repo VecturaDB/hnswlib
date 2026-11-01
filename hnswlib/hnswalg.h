@@ -182,7 +182,7 @@ namespace hnswlib
     const int PERSISTENCE_VERSION = 1; // Used by persistent indices to check if the index on disk is compatible with the code
 
     // The journal of a save (persistDirtyWithJournal): the bytes that persistDirty writes, each with its file and
-    // offset, written and synced before persistDirty starts, removed once the four files are synced. persistDirty
+    // offset, written before persistDirty starts, removed once the four files are written. persistDirty
     // writes the files in place, so a kill in the middle of it leaves files of two checkpoints; applyPersistJournal
     // writes the bytes of the journal again at load. The layout: the magic and the version, then records of a file (an
     // index in PERSIST_JOURNAL_FILES), an offset, a size and the bytes, then the number of records and the FNV-1a 64 of
@@ -246,9 +246,9 @@ namespace hnswlib
             throw std::runtime_error("Cannot sync file: " + path);
     }
 
-    // Writes a whole file in place of the one there, its bytes made durable. On Windows the path is taken as a long path,
-    // so that a file with a longer name than data_level0.bin is written wherever the index is.
-    inline void writePersistedWholeFile(const std::string &path, const char *data, size_t size)
+    // Writes a whole file in place of the one there, its bytes made durable when sync is set. On Windows the path is taken
+    // as a long path, so that a file with a longer name than data_level0.bin is written wherever the index is.
+    inline void writePersistedWholeFile(const std::string &path, const char *data, size_t size, bool sync = true)
     {
 #ifdef _WIN32
         int wide_size = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
@@ -270,7 +270,7 @@ namespace hnswlib
             throw std::runtime_error("Cannot open file: " + path);
         DWORD written = 0;
         bool ok = size == 0 || (WriteFile(file, data, (DWORD)size, &written, nullptr) && written == size);
-        ok = ok && FlushFileBuffers(file);
+        ok = ok && (!sync || FlushFileBuffers(file));
         CloseHandle(file);
         if (!ok)
             throw std::runtime_error("Cannot write file: " + path);
@@ -289,9 +289,9 @@ namespace hnswlib
             }
             done += (size_t)n;
         }
-        int result = fsync(fd);
-        close(fd);
-        if (result != 0)
+        int result = sync ? fsync(fd) : 0;
+        int closed = close(fd);
+        if (result != 0 || closed != 0)
             throw std::runtime_error("Cannot sync file: " + path);
 #endif
     }
@@ -312,7 +312,7 @@ namespace hnswlib
 #endif
     }
 
-    inline void removePersistJournal(const std::string &location)
+    inline void removePersistJournal(const std::string &location, bool sync = true)
     {
         std::string path = location + "/" + PERSIST_JOURNAL_FILE;
         if (std::remove(path.c_str()) != 0)
@@ -321,7 +321,8 @@ namespace hnswlib
                 return;
             throw std::runtime_error("Cannot remove journal: " + path);
         }
-        syncPersistDirectory(location);
+        if (sync)
+            syncPersistDirectory(location);
     }
 
     // Writes a journal through stdio, which can sync it, with the FNV-1a 64 of what it writes.
@@ -373,8 +374,8 @@ namespace hnswlib
             write((const char *)&value, sizeof(T));
         }
 
-        // The end of the journal, then its bytes made durable.
-        void finish()
+        // The end of the journal, then its bytes written, and made durable when sync is set.
+        void finish(bool sync = true)
         {
             writePOD(records_);
             uint64_t hash = hash_.value();
@@ -382,9 +383,9 @@ namespace hnswlib
             if (std::fflush(file_) != 0)
                 throw std::runtime_error("Cannot write journal: " + path_);
 #ifdef _WIN32
-            int synced = _commit(_fileno(file_));
+            int synced = sync ? _commit(_fileno(file_)) : 0;
 #else
-            int synced = fsync(fileno(file_));
+            int synced = sync ? fsync(fileno(file_)) : 0;
 #endif
             int closed = std::fclose(file_);
             file_ = nullptr;
@@ -1555,7 +1556,7 @@ namespace hnswlib
             return persist_location_ + "/" + PERSIST_JOURNAL_FILE;
         }
 
-        // The first step of persistDirtyWithJournal: the journal of the bytes that persistDirty would write now, synced.
+        // The first step of persistDirtyWithJournal: the journal of the bytes that persistDirty would write now.
         // Alone it leaves the files as they are, for tests and tools.
         void writePersistJournal(const std::vector<std::pair<std::string, std::string>> &whole_files = {})
         {
@@ -1627,12 +1628,12 @@ namespace hnswlib
             }
             for (const auto &whole : whole_files)
                 journal.wholeFile(whole.first, whole.second.data(), whole.second.size());
-            journal.finish();
-            syncPersistDirectory(persist_location_);
+            // As the files of a save, the journal is written and not synced: see persistDirtyWithJournal.
+            journal.finish(false);
         }
 
-        // persistDirty with a journal: the journal of the dirty elements and of the whole files given written and synced
-        // first, then persistDirty, then the four files synced, the whole files written in the folder of the index, and
+        // persistDirty with a journal: the journal of the dirty elements and of the whole files given written first, then
+        // persistDirty, then the whole files written in the folder of the index, and
         // the journal removed. A kill in the middle leaves the journal, which applyPersistJournal writes again to all of
         // them at load: the index and the whole files are of the same save.
         void persistDirtyWithJournal(const std::vector<std::pair<std::string, std::string>> &whole_files = {})
@@ -1642,17 +1643,15 @@ namespace hnswlib
                 return;
             }
 
+            // The durability of Chroma 1.5.9, whose save flushes its files and syncs none: a kill keeps every save, which
+            // the page cache holds, whole or thrown away by the journal; a power loss or a crash of the system can lose
+            // the last saves or leave them torn, as in 1.5.9. A sync of each file under the write lock of the index made
+            // every write wait for the disk. The journal applied at load still syncs what it writes.
             writePersistJournal(whole_files);
             persistDirty();
-            syncPersistedFile(getHeaderLocation());
-            syncPersistedFile(getDataLevel0Location());
-            syncPersistedFile(getLengthLocation());
-            syncPersistedFile(getLinkListLocation());
             for (const auto &whole : whole_files)
-                writePersistedWholeFile(persist_location_ + "/" + whole.first, whole.second.data(), whole.second.size());
-            if (!whole_files.empty())
-                syncPersistDirectory(persist_location_);
-            removePersistJournal(persist_location_);
+                writePersistedWholeFile(persist_location_ + "/" + whole.first, whole.second.data(), whole.second.size(), false);
+            removePersistJournal(persist_location_, false);
         }
 
         constexpr size_t calculateHeaderSize() const {
