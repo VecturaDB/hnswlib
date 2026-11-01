@@ -152,6 +152,25 @@ public:
     appr_alg->writePersistJournal();
   }
 
+  // The save and the journal with a whole file of the caller in the same journal.
+  void persist_dirty_with_journal_file(const std::string &name, const std::string &bytes)
+  {
+    if (!index_inited)
+    {
+      throw std::runtime_error("Index not inited");
+    }
+    appr_alg->persistDirtyWithJournal({{name, bytes}});
+  }
+
+  void write_persist_journal_file(const std::string &name, const std::string &bytes)
+  {
+    if (!index_inited)
+    {
+      throw std::runtime_error("Index not inited");
+    }
+    appr_alg->writePersistJournal({{name, bytes}});
+  }
+
   void add_item(const data_t *data, const hnswlib::labeltype id, const bool replace_deleted = false)
   {
     if (!index_inited)
@@ -382,6 +401,36 @@ extern "C"
     try
     {
       index->write_persist_journal();
+    }
+    catch (std::exception &e)
+    {
+      last_error = e.what();
+      return;
+    }
+    last_error.clear();
+  }
+
+  // Can throw std::exception
+  void persist_dirty_with_journal_file(Index<float> *index, const char *name, const char *data, size_t size)
+  {
+    try
+    {
+      index->persist_dirty_with_journal_file(name, std::string(data, size));
+    }
+    catch (std::exception &e)
+    {
+      last_error = e.what();
+      return;
+    }
+    last_error.clear();
+  }
+
+  // Can throw std::exception
+  void write_persist_journal_file(Index<float> *index, const char *name, const char *data, size_t size)
+  {
+    try
+    {
+      index->write_persist_journal_file(name, std::string(data, size));
     }
     catch (std::exception &e)
     {

@@ -56,6 +56,18 @@ extern "C" {
     fn persist_dirty(index: *const HnswIndexPtrFFI);
     fn persist_dirty_with_journal(index: *const HnswIndexPtrFFI);
     fn write_persist_journal(index: *const HnswIndexPtrFFI);
+    fn persist_dirty_with_journal_file(
+        index: *const HnswIndexPtrFFI,
+        name: *const c_char,
+        data: *const u8,
+        size: usize,
+    );
+    fn write_persist_journal_file(
+        index: *const HnswIndexPtrFFI,
+        name: *const c_char,
+        data: *const u8,
+        size: usize,
+    );
     #[link_name = "apply_persist_journal"]
     fn apply_persist_journal_ffi(path: *const c_char) -> c_int;
 
@@ -434,6 +446,26 @@ impl HnswIndex {
     /// For tests and tools that need a save cut after its journal.
     pub fn write_persist_journal(&self) -> Result<(), HnswError> {
         unsafe { write_persist_journal(self.ffi_ptr) };
+        read_and_return_hnsw_error(self.ffi_ptr)?;
+        Ok(())
+    }
+
+    /// `save_with_journal` with a whole file of the caller, `name` in the folder of the index, in the same journal: the
+    /// save of the index and of that file is whole or thrown away. The file is written after the four files of the
+    /// index; a kill in the middle leaves the journal, which `apply_persist_journal` writes again to all of them.
+    pub fn save_with_journal_file(&self, name: &str, bytes: &[u8]) -> Result<(), HnswError> {
+        let name = CString::new(name).map_err(|e| HnswError::FFIException(e.to_string()))?;
+        unsafe {
+            persist_dirty_with_journal_file(self.ffi_ptr, name.as_ptr(), bytes.as_ptr(), bytes.len())
+        };
+        read_and_return_hnsw_error(self.ffi_ptr)?;
+        Ok(())
+    }
+
+    /// The first step of `save_with_journal_file` alone, for tests and tools that need a save cut after its journal.
+    pub fn write_persist_journal_file(&self, name: &str, bytes: &[u8]) -> Result<(), HnswError> {
+        let name = CString::new(name).map_err(|e| HnswError::FFIException(e.to_string()))?;
+        unsafe { write_persist_journal_file(self.ffi_ptr, name.as_ptr(), bytes.as_ptr(), bytes.len()) };
         read_and_return_hnsw_error(self.ffi_ptr)?;
         Ok(())
     }
@@ -1179,6 +1211,101 @@ pub mod test {
             assert_eq!(index_files(dir.path()), new);
         }
         assert_journal_fixture_saved(dir.path());
+    }
+
+    const ID_MAP: &str = "index_metadata.pickle";
+
+    // A save with a whole file of the caller writes it with the index and leaves no journal.
+    #[test]
+    fn persistence_journal_saves_a_whole_file_with_the_index() {
+        let dir = tempdir().unwrap();
+        let index = journal_fixture(dir.path());
+        index.save_with_journal_file(ID_MAP, b"the map of the save").unwrap();
+        assert_eq!(std::fs::read(dir.path().join(ID_MAP)).unwrap(), b"the map of the save");
+        assert!(!dir.path().join(PERSIST_JOURNAL_FILE).exists());
+        index.close_fd();
+        drop(index);
+        assert_journal_fixture_saved(dir.path());
+    }
+
+    // A save cut after its journal: the index and the whole file come back from the same save, the file written whole
+    // over the one of the save before.
+    #[test]
+    fn persistence_journal_mends_the_index_and_the_whole_file_of_a_cut_save() {
+        let dir = tempdir().unwrap();
+        let index = journal_fixture(dir.path());
+        std::fs::write(dir.path().join(ID_MAP), b"the map of the save before, longer than the new one").unwrap();
+        let old = index_files(dir.path());
+        index.write_persist_journal_file(ID_MAP, b"the map of the save").unwrap();
+        index.save().unwrap();
+        let new = index_files(dir.path());
+        index.close_fd();
+        drop(index);
+        for (name, bytes) in INDEX_FILES.iter().zip(&old).skip(1) {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        assert_eq!(
+            apply_persist_journal(dir.path()).unwrap(),
+            PersistJournal::Applied
+        );
+        assert_eq!(index_files(dir.path()), new);
+        assert_eq!(std::fs::read(dir.path().join(ID_MAP)).unwrap(), b"the map of the save");
+        assert!(!dir.path().join(PERSIST_JOURNAL_FILE).exists());
+        assert_journal_fixture_saved(dir.path());
+    }
+
+    // A journal with a whole file, cut while it was written, is removed, and the file of the save before stays.
+    #[test]
+    fn persistence_journal_cut_while_written_leaves_the_whole_file() {
+        let dir = tempdir().unwrap();
+        let index = journal_fixture(dir.path());
+        std::fs::write(dir.path().join(ID_MAP), b"the map of the save before").unwrap();
+        index.write_persist_journal_file(ID_MAP, b"the map of the save").unwrap();
+        index.close_fd();
+        drop(index);
+        let journal = std::fs::read(dir.path().join(PERSIST_JOURNAL_FILE)).unwrap();
+        std::fs::write(dir.path().join(PERSIST_JOURNAL_FILE), &journal[..journal.len() - 1]).unwrap();
+        assert_eq!(
+            apply_persist_journal(dir.path()).unwrap(),
+            PersistJournal::Discarded
+        );
+        assert_eq!(std::fs::read(dir.path().join(ID_MAP)).unwrap(), b"the map of the save before");
+    }
+
+    // The FNV-1a 64 of bytes, as the end of a journal holds it.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ *byte as u64).wrapping_mul(0x100000001b3)
+        })
+    }
+
+    // A journal of another version, as version 1, which no release wrote, is removed as an incomplete one, and the files
+    // stay as they are.
+    #[test]
+    fn persistence_journal_of_another_version_is_removed() {
+        let dir = tempdir().unwrap();
+        let index = journal_fixture(dir.path());
+        let old = index_files(dir.path());
+        index.write_persist_journal().unwrap();
+        index.save().unwrap();
+        index.close_fd();
+        drop(index);
+        let mut journal = std::fs::read(dir.path().join(PERSIST_JOURNAL_FILE)).unwrap();
+        assert_eq!(journal[8..12], 2u32.to_ne_bytes());
+        journal[8..12].copy_from_slice(&1u32.to_ne_bytes());
+        let end = journal.len() - 8;
+        let hash = fnv1a64(&journal[..end]);
+        journal[end..].copy_from_slice(&hash.to_ne_bytes());
+        std::fs::write(dir.path().join(PERSIST_JOURNAL_FILE), &journal).unwrap();
+        for (name, bytes) in INDEX_FILES.iter().zip(&old) {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        assert_eq!(
+            apply_persist_journal(dir.path()).unwrap(),
+            PersistJournal::Discarded
+        );
+        assert_eq!(index_files(dir.path()), old);
+        assert!(!dir.path().join(PERSIST_JOURNAL_FILE).exists());
     }
 
     // A journal cut or damaged while it was written: the save had not touched the files yet.

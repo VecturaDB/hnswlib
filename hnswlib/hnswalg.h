@@ -24,6 +24,13 @@
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -182,14 +189,19 @@ namespace hnswlib
     // every byte before it. A journal without a valid end was cut while it was written, before persistDirty touched
     // any file: it is removed without being applied. Its name is no longer than data_level0.bin: on Windows the files
     // are opened without long paths, so a folder that holds data_level0.bin within MAX_PATH holds the journal too.
+    // Version 2 adds records of a whole file of the caller, as the ID map that goes with the index, so that the save of
+    // the index and of that file is whole or thrown away: the file of the record is PERSIST_JOURNAL_WHOLE_FILE, the
+    // offset the length of its name, the size that of its name and its bytes, which follow. Version 1 was never in a
+    // release: a journal of another version is removed as an incomplete one.
     const char PERSIST_JOURNAL_FILE[] = "journal.bin";
     const char PERSIST_JOURNAL_MAGIC[8] = {'H', 'N', 'S', 'W', 'J', 'R', 'N', 'L'};
-    const uint32_t PERSIST_JOURNAL_VERSION = 1;
+    const uint32_t PERSIST_JOURNAL_VERSION = 2;
     const char *const PERSIST_JOURNAL_FILES[4] = {"header.bin", "data_level0.bin", "length.bin", "link_lists.bin"};
     const uint8_t PERSIST_JOURNAL_HEADER = 0;
     const uint8_t PERSIST_JOURNAL_DATA_LEVEL0 = 1;
     const uint8_t PERSIST_JOURNAL_LENGTH = 2;
     const uint8_t PERSIST_JOURNAL_LINK_LISTS = 3;
+    const uint8_t PERSIST_JOURNAL_WHOLE_FILE = 4;
     const size_t PERSIST_JOURNAL_PIECE = 1 << 20;
 
     enum class PersistJournalOutcome
@@ -232,6 +244,56 @@ namespace hnswlib
 #endif
         if (result != 0)
             throw std::runtime_error("Cannot sync file: " + path);
+    }
+
+    // Writes a whole file in place of the one there, its bytes made durable. On Windows the path is taken as a long path,
+    // so that a file with a longer name than data_level0.bin is written wherever the index is.
+    inline void writePersistedWholeFile(const std::string &path, const char *data, size_t size)
+    {
+#ifdef _WIN32
+        int wide_size = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+        if (wide_size <= 0)
+            throw std::runtime_error("Cannot convert path: " + path);
+        std::wstring wide(wide_size, 0);
+        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wide[0], wide_size);
+        wide.resize(wide_size - 1);
+        DWORD full_size = GetFullPathNameW(wide.c_str(), 0, nullptr, nullptr);
+        if (full_size == 0)
+            throw std::runtime_error("Cannot resolve path: " + path);
+        std::wstring full(full_size, 0);
+        full_size = GetFullPathNameW(wide.c_str(), full_size, &full[0], nullptr);
+        full.resize(full_size);
+        const std::wstring prefix = L"\\\\?\\";
+        std::wstring long_path = full.rfind(prefix, 0) == 0 ? full : prefix + full;
+        HANDLE file = CreateFileW(long_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+            throw std::runtime_error("Cannot open file: " + path);
+        DWORD written = 0;
+        bool ok = size == 0 || (WriteFile(file, data, (DWORD)size, &written, nullptr) && written == size);
+        ok = ok && FlushFileBuffers(file);
+        CloseHandle(file);
+        if (!ok)
+            throw std::runtime_error("Cannot write file: " + path);
+#else
+        int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0)
+            throw std::runtime_error("Cannot open file: " + path);
+        size_t done = 0;
+        while (done < size)
+        {
+            ssize_t n = write(fd, data + done, size - done);
+            if (n <= 0)
+            {
+                close(fd);
+                throw std::runtime_error("Cannot write file: " + path);
+            }
+            done += (size_t)n;
+        }
+        int result = fsync(fd);
+        close(fd);
+        if (result != 0)
+            throw std::runtime_error("Cannot sync file: " + path);
+#endif
     }
 
     // Makes a file created or removed in a directory durable. Windows has no sync of a directory.
@@ -288,6 +350,14 @@ namespace hnswlib
             writePOD(offset);
             writePOD(size);
             records_++;
+        }
+
+        // A record of a whole file, its name then its bytes.
+        void wholeFile(const std::string &name, const char *data, size_t size)
+        {
+            record(PERSIST_JOURNAL_WHOLE_FILE, name.size(), name.size() + size);
+            write(name.data(), name.size());
+            write(data, size);
         }
 
         void write(const char *data, size_t size)
@@ -369,7 +439,8 @@ namespace hnswlib
                 !readPersistJournal(input, (char *)&length, sizeof(length), hash))
                 return false;
             position += record_head;
-            if (file > PERSIST_JOURNAL_LINK_LISTS || length > size - end - position)
+            if (file > PERSIST_JOURNAL_WHOLE_FILE || length > size - end - position ||
+                (file == PERSIST_JOURNAL_WHOLE_FILE && offset > length))
                 return false;
             for (uint64_t left = length; left > 0;)
             {
@@ -426,6 +497,7 @@ namespace hnswlib
                 throw std::runtime_error("Cannot open file: " + location + "/" + PERSIST_JOURNAL_FILES[i]);
         }
         std::vector<char> piece(PERSIST_JOURNAL_PIECE);
+        std::vector<std::pair<std::string, std::string>> whole_files;
         uint64_t position = sizeof(PERSIST_JOURNAL_MAGIC) + sizeof(uint32_t);
         while (position < size - 2 * sizeof(uint64_t))
         {
@@ -435,6 +507,16 @@ namespace hnswlib
             readBinaryPOD(input, file);
             readBinaryPOD(input, offset);
             readBinaryPOD(input, length);
+            position += sizeof(file) + sizeof(offset) + sizeof(length) + length;
+            if (file == PERSIST_JOURNAL_WHOLE_FILE)
+            {
+                std::string name(offset, 0);
+                std::string bytes(length - offset, 0);
+                input.read(&name[0], name.size());
+                input.read(&bytes[0], bytes.size());
+                whole_files.emplace_back(std::move(name), std::move(bytes));
+                continue;
+            }
             outputs[file].seekp(offset, std::ios::beg);
             for (uint64_t left = length; left > 0;)
             {
@@ -443,7 +525,6 @@ namespace hnswlib
                 outputs[file].write(piece.data(), bytes);
                 left -= bytes;
             }
-            position += sizeof(file) + sizeof(offset) + sizeof(length) + length;
         }
         bool written = input.good();
         for (int i = 0; i < 4; i++)
@@ -457,6 +538,10 @@ namespace hnswlib
             throw std::runtime_error("Cannot apply journal: " + path);
         for (int i = 0; i < 4; i++)
             syncPersistedFile(location + "/" + PERSIST_JOURNAL_FILES[i]);
+        for (const auto &whole : whole_files)
+            writePersistedWholeFile(location + "/" + whole.first, whole.second.data(), whole.second.size());
+        if (!whole_files.empty())
+            syncPersistDirectory(location);
         removePersistJournal(location);
         return PersistJournalOutcome::Applied;
     }
@@ -1472,7 +1557,7 @@ namespace hnswlib
 
         // The first step of persistDirtyWithJournal: the journal of the bytes that persistDirty would write now, synced.
         // Alone it leaves the files as they are, for tests and tools.
-        void writePersistJournal()
+        void writePersistJournal(const std::vector<std::pair<std::string, std::string>> &whole_files = {})
         {
             if (!persist_on_write_)
             {
@@ -1540,26 +1625,33 @@ namespace hnswlib
                 }
                 offset += bytes;
             }
+            for (const auto &whole : whole_files)
+                journal.wholeFile(whole.first, whole.second.data(), whole.second.size());
             journal.finish();
             syncPersistDirectory(persist_location_);
         }
 
-        // persistDirty with a journal: the journal of the dirty elements written and synced first, then persistDirty,
-        // then the four files synced and the journal removed. A kill in the middle leaves the journal, which
-        // applyPersistJournal writes again to the files at load.
-        void persistDirtyWithJournal()
+        // persistDirty with a journal: the journal of the dirty elements and of the whole files given written and synced
+        // first, then persistDirty, then the four files synced, the whole files written in the folder of the index, and
+        // the journal removed. A kill in the middle leaves the journal, which applyPersistJournal writes again to all of
+        // them at load: the index and the whole files are of the same save.
+        void persistDirtyWithJournal(const std::vector<std::pair<std::string, std::string>> &whole_files = {})
         {
-            if (elements_to_persist_.size() == 0)
+            if (elements_to_persist_.size() == 0 && whole_files.empty())
             {
                 return;
             }
 
-            writePersistJournal();
+            writePersistJournal(whole_files);
             persistDirty();
             syncPersistedFile(getHeaderLocation());
             syncPersistedFile(getDataLevel0Location());
             syncPersistedFile(getLengthLocation());
             syncPersistedFile(getLinkListLocation());
+            for (const auto &whole : whole_files)
+                writePersistedWholeFile(persist_location_ + "/" + whole.first, whole.second.data(), whole.second.size());
+            if (!whole_files.empty())
+                syncPersistDirectory(persist_location_);
             removePersistJournal(persist_location_);
         }
 
