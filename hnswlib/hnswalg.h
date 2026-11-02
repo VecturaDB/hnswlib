@@ -585,6 +585,10 @@ namespace hnswlib
         char *length_memory_{nullptr};
         char **linkLists_{nullptr};
         std::vector<int> element_levels_; // keeps level of each element
+        // The offset in link_lists.bin of the list of each element counted so far: the lists of all the elements before
+        // it, each after its size. The level of an element is fixed when it is added, so these offsets never change;
+        // the cache only grows, and a load of the index clears it.
+        std::vector<uint64_t> link_list_offsets_;
 
         size_t data_size_{0};
 
@@ -1477,6 +1481,24 @@ namespace hnswlib
         }
 
         // Persistence functions
+        unsigned int linkListSizeOf(size_t i) const
+        {
+            return element_levels_[i] > 0 ? size_links_per_element_ * element_levels_[i] : 0;
+        }
+
+        // The offset of the link list of element i in link_lists.bin, for i < cur_element_count.
+        uint64_t linkListOffset(size_t i)
+        {
+            if (link_list_offsets_.empty())
+                link_list_offsets_.push_back(0);
+            while (link_list_offsets_.size() <= i)
+            {
+                size_t last = link_list_offsets_.size() - 1;
+                link_list_offsets_.push_back(link_list_offsets_[last] + sizeof(unsigned int) + linkListSizeOf(last));
+            }
+            return link_list_offsets_[i];
+        }
+
         void persistDirty()
         {
             if (elements_to_persist_.size() == 0)
@@ -1520,23 +1542,17 @@ namespace hnswlib
             this->output_length_.flush();
 
             // Write the dirty link lists
-            this->output_link_lists_.seekp(0, std::ios::beg);
-            auto dirty_elements_iter = elements_to_persist_.begin();
-            // TODO: don't need to iterate over potentially all elements, could store it or memoize
-            for (size_t i = 0; i < cur_element_count && dirty_elements_iter != elements_to_persist_.end(); i++)
+            // Each dirty list at its offset, kept between saves: a walk over every element made each save grow with
+            // the index.
+            for (const auto &id : elements_to_persist_)
             {
-                unsigned int linkListSize = element_levels_[i] > 0 ? size_links_per_element_ * element_levels_[i] : 0;
-                if (i == *dirty_elements_iter)
-                {
-                    writeBinaryPOD(this->output_link_lists_, linkListSize);
-                    if (linkListSize)
-                        this->output_link_lists_.write(linkLists_[i], linkListSize);
-                    dirty_elements_iter = std::next(dirty_elements_iter);
-                }
-                else
-                {
-                    this->output_link_lists_.seekp(linkListSize + sizeof(unsigned int), this->output_link_lists_.cur);
-                }
+                if (id >= cur_element_count)
+                    break;
+                unsigned int linkListSize = linkListSizeOf(id);
+                this->output_link_lists_.seekp(linkListOffset(id), std::ios::beg);
+                writeBinaryPOD(this->output_link_lists_, linkListSize);
+                if (linkListSize)
+                    this->output_link_lists_.write(linkLists_[id], linkListSize);
             }
             this->output_link_lists_.flush();
 
@@ -1601,30 +1617,23 @@ namespace hnswlib
 
             // A link list has no fixed size: an element lies after the lists of all the elements before it, as
             // persistDirty walks them.
-            auto linkListSize = [this](size_t i) -> unsigned int {
-                return element_levels_[i] > 0 ? size_links_per_element_ * element_levels_[i] : 0;
-            };
-            uint64_t offset = 0;
-            size_t i = 0;
             for (const auto &run : runs)
             {
                 if (run.first >= cur_element_count)
                     break;
-                for (; i < run.first; i++)
-                    offset += sizeof(unsigned int) + linkListSize(i);
                 size_t last = std::min<size_t>(run.second, cur_element_count);
+                uint64_t offset = linkListOffset(run.first);
                 uint64_t bytes = 0;
                 for (size_t j = run.first; j < last; j++)
-                    bytes += sizeof(unsigned int) + linkListSize(j);
+                    bytes += sizeof(unsigned int) + linkListSizeOf(j);
                 journal.record(PERSIST_JOURNAL_LINK_LISTS, offset, bytes);
-                for (; i < last; i++)
+                for (size_t j = run.first; j < last; j++)
                 {
-                    unsigned int size = linkListSize(i);
+                    unsigned int size = linkListSizeOf(j);
                     journal.writePOD(size);
                     if (size)
-                        journal.write(linkLists_[i], size);
+                        journal.write(linkLists_[j], size);
                 }
-                offset += bytes;
             }
             for (const auto &whole : whole_files)
                 journal.wholeFile(whole.first, whole.second.data(), whole.second.size());
@@ -1883,6 +1892,7 @@ namespace hnswlib
             if (linkLists_ == nullptr)
                 throw std::runtime_error("Not enough memory: loadPersistedIndex failed to allocate linklists");
             element_levels_ = std::vector<int>(max_elements_);
+            link_list_offsets_.clear();
             revSize_ = 1.0 / mult_;
             ef_ = 10;
             for (size_t i = 0; i < cur_element_count; i++)
