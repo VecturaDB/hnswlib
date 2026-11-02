@@ -183,6 +183,154 @@ pub fn apply_persist_journal(path: &std::path::Path) -> Result<PersistJournal, H
     })
 }
 
+/// A journal left in the folder of an index, as `persist_journals` reads it without applying it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PersistJournalInfo {
+    /// The file of the journal in the folder.
+    pub name: String,
+    /// Whether it is whole: its end and its hash are there, so `apply_persist_journal` would apply it.
+    pub complete: bool,
+    /// The whole files it carries, by name, with their bytes: for VecturaDB the ID map of the save.
+    pub whole_files: Vec<(String, Vec<u8>)>,
+}
+
+/// The journals left in the folder of an index, in the order `apply_persist_journal` applies them, read and not applied:
+/// so that the caller can tell whether they are older than the files, saved after them by a program that writes no
+/// journal, and then discard them with `discard_persist_journals` instead of applying them.
+pub fn persist_journals(path: &std::path::Path) -> Result<Vec<PersistJournalInfo>, HnswInitError> {
+    let mut names = Vec::new();
+    if path.join(PERSIST_JOURNAL_FILE).is_file() {
+        names.push(PERSIST_JOURNAL_FILE.to_string());
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let (complete, whole_files) = read_journal(&path.join(&name))
+                .map_err(|e| HnswInitError::InvalidPath(e.to_string()))?;
+            Ok(PersistJournalInfo {
+                name,
+                complete,
+                whole_files,
+            })
+        })
+        .collect()
+}
+
+/// Every journal left in the folder of an index removed, unapplied, each removal made durable.
+pub fn discard_persist_journals(path: &std::path::Path) -> Result<(), HnswInitError> {
+    for journal in persist_journals(path)? {
+        match std::fs::remove_file(path.join(&journal.name)) {
+            Ok(()) => sync_folder(path)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(HnswInitError::InvalidPath(e.to_string())),
+        }
+    }
+    Ok(())
+}
+
+// The layout of PersistJournalWriter (hnswlib/hnswalg.h): the magic, the version, records of a file, an offset, a size
+// and the bytes, then the number of records and the FNV-1a 64 of everything before it, in the byte order of the
+// machine. Whole if all of it is there and the hash matches, as persistJournalComplete checks it.
+fn read_journal(path: &std::path::Path) -> std::io::Result<(bool, Vec<(String, Vec<u8>)>)> {
+    use std::io::Read;
+    const MAGIC: &[u8; 8] = b"HNSWJRNL";
+    const VERSION: u32 = 2;
+    const WHOLE_FILE: u8 = 4;
+    let size = std::fs::metadata(path)?.len();
+    let mut input = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut hash: u64 = 0xcbf29ce484222325;
+    let read = |input: &mut std::io::BufReader<std::fs::File>, buffer: &mut [u8], hash: &mut u64| -> std::io::Result<bool> {
+        match input.read_exact(buffer) {
+            Ok(()) => {
+                for byte in buffer.iter() {
+                    *hash = (*hash ^ *byte as u64).wrapping_mul(0x100000001b3);
+                }
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(e) => Err(e),
+        }
+    };
+    let mut whole_files = Vec::new();
+    let head = 8 + 4;
+    let end = 16;
+    if size < head + end {
+        return Ok((false, whole_files));
+    }
+    let mut magic = [0u8; 8];
+    let mut version = [0u8; 4];
+    if !read(&mut input, &mut magic, &mut hash)?
+        || &magic != MAGIC
+        || !read(&mut input, &mut version, &mut hash)?
+        || u32::from_ne_bytes(version) != VERSION
+    {
+        return Ok((false, whole_files));
+    }
+    let mut position = head;
+    let mut records = 0u64;
+    let mut piece = vec![0u8; 1 << 20];
+    while position < size - end {
+        let mut file = [0u8; 1];
+        let mut offset = [0u8; 8];
+        let mut length = [0u8; 8];
+        if size - end - position < 17
+            || !read(&mut input, &mut file, &mut hash)?
+            || !read(&mut input, &mut offset, &mut hash)?
+            || !read(&mut input, &mut length, &mut hash)?
+        {
+            return Ok((false, whole_files));
+        }
+        position += 17;
+        let (file, offset, length) = (file[0], u64::from_ne_bytes(offset), u64::from_ne_bytes(length));
+        if file > WHOLE_FILE || length > size - end - position || (file == WHOLE_FILE && offset > length) {
+            return Ok((false, whole_files));
+        }
+        if file == WHOLE_FILE {
+            let mut bytes = vec![0u8; length as usize];
+            if !read(&mut input, &mut bytes, &mut hash)? {
+                return Ok((false, whole_files));
+            }
+            let data = bytes.split_off(offset as usize);
+            whole_files.push((String::from_utf8_lossy(&bytes).into_owned(), data));
+        } else {
+            let mut left = length;
+            while left > 0 {
+                let bytes = left.min(piece.len() as u64) as usize;
+                if !read(&mut input, &mut piece[..bytes], &mut hash)? {
+                    return Ok((false, whole_files));
+                }
+                left -= bytes as u64;
+            }
+        }
+        position += length;
+        records += 1;
+    }
+    let mut count = [0u8; 8];
+    if !read(&mut input, &mut count, &mut hash)? {
+        return Ok((false, whole_files));
+    }
+    let expected = hash;
+    let mut stored = [0u8; 8];
+    if input.read_exact(&mut stored).is_err() {
+        return Ok((false, whole_files));
+    }
+    Ok((
+        u64::from_ne_bytes(count) == records && u64::from_ne_bytes(stored) == expected,
+        whole_files,
+    ))
+}
+
+// The removal of a file made durable: Windows has no sync of a folder.
+fn sync_folder(path: &std::path::Path) -> Result<(), HnswInitError> {
+    #[cfg(unix)]
+    std::fs::File::open(path)
+        .and_then(|folder| folder.sync_all())
+        .map_err(|e| HnswInitError::InvalidPath(e.to_string()))?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HnswDistanceFunction {
     Euclidean,
@@ -1122,6 +1270,38 @@ pub mod test {
                 journal_vector(id, round).to_vec()
             );
         }
+    }
+
+    // The journal of a save cut by a stop is read without being applied: whole, with the ID map it carries; cut while
+    // it was written, not whole. A discard removes it and leaves the files as they are.
+    #[test]
+    fn a_journal_left_is_read_and_discarded_without_being_applied() {
+        let dir = tempdir().unwrap();
+        let index = journal_fixture(dir.path());
+        index
+            .write_persist_journal_file("index_metadata.pickle", b"the map of the save")
+            .unwrap();
+        index.close_fd();
+        drop(index);
+        let journals = persist_journals(dir.path()).unwrap();
+        assert_eq!(
+            journals,
+            vec![PersistJournalInfo {
+                name: PERSIST_JOURNAL_FILE.to_string(),
+                complete: true,
+                whole_files: vec![(
+                    "index_metadata.pickle".to_string(),
+                    b"the map of the save".to_vec()
+                )],
+            }]
+        );
+        let journal = std::fs::read(dir.path().join(PERSIST_JOURNAL_FILE)).unwrap();
+        std::fs::write(dir.path().join(PERSIST_JOURNAL_FILE), &journal[..journal.len() - 1]).unwrap();
+        assert!(!persist_journals(dir.path()).unwrap()[0].complete);
+        let files = index_files(dir.path());
+        discard_persist_journals(dir.path()).unwrap();
+        assert!(persist_journals(dir.path()).unwrap().is_empty());
+        assert_eq!(index_files(dir.path()), files);
     }
 
     #[test]
