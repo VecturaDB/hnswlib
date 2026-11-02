@@ -1,6 +1,8 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Tell cargo to rerun this build script if the bindings change.
     println!("cargo:rerun-if-changed=src/bindings.cpp");
+    // And if hnswlib changes: the bindings include its headers, which cc does not track.
+    println!("cargo:rerun-if-changed=hnswlib");
     // Compile the hnswlib bindings.
     cc::Build::new()
         .cpp(true)
