@@ -804,6 +804,60 @@ pub mod test {
         }
     }
 
+    // Saves after every batch, with a load of the index in the middle, leave files that load the same graph as the one
+    // in memory: each link list is written at the offset of its element, which the index keeps between saves and
+    // computes again after a load.
+    #[test]
+    fn saves_of_batches_across_a_load_write_each_link_list_at_its_offset() {
+        let n: usize = 600;
+        let d: usize = 8;
+        let data = generate_random_data(n, d);
+        let tmp_dir = tempdir().unwrap();
+        let path = tmp_dir.path().to_path_buf();
+        let load = || {
+            HnswIndex::load(HnswIndexLoadConfig {
+                distance_function: HnswDistanceFunction::Euclidean,
+                dimensionality: d as i32,
+                persist_path: path.clone(),
+                ef_search: 100,
+            })
+            .unwrap()
+        };
+        // m 4 gives elements on upper levels, whose link lists are longer than those of level 0.
+        let mut index = HnswIndex::init(HnswIndexInitConfig {
+            distance_function: HnswDistanceFunction::Euclidean,
+            dimensionality: d as i32,
+            max_elements: n,
+            m: 4,
+            ef_construction: 20,
+            ef_search: 100,
+            random_seed: 7,
+            persist_path: Some(path.clone()),
+        })
+        .unwrap();
+        for batch in 0..6 {
+            if batch == 3 {
+                index.close_fd();
+                index = load();
+            }
+            for i in batch * 100..(batch + 1) * 100 {
+                index.add(i, &data[i * d..(i + 1) * d]).unwrap();
+            }
+            index.open_fd().unwrap();
+            index.save_with_journal().unwrap();
+        }
+        index.close_fd();
+        let loaded = load();
+        for i in 0..n {
+            let query = &data[i * d..(i + 1) * d];
+            assert_eq!(
+                index.query(query, 10, &[], &[]).unwrap(),
+                loaded.query(query, 10, &[], &[]).unwrap(),
+                "element {i}"
+            );
+        }
+    }
+
     #[test]
     fn it_initializes_and_can_set_get_ef() {
         let n = 1000;
