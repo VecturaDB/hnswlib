@@ -1574,7 +1574,7 @@ namespace hnswlib
 
         // The first step of persistDirtyWithJournal: the journal of the bytes that persistDirty would write now.
         // Alone it leaves the files as they are, for tests and tools.
-        void writePersistJournal(const std::vector<std::pair<std::string, std::string>> &whole_files = {})
+        void writePersistJournal(const std::vector<std::pair<std::string, std::string>> &whole_files = {}, bool sync = false)
         {
             if (!persist_on_write_)
             {
@@ -1637,8 +1637,8 @@ namespace hnswlib
             }
             for (const auto &whole : whole_files)
                 journal.wholeFile(whole.first, whole.second.data(), whole.second.size());
-            // As the files of a save, the journal is written and not synced: see persistDirtyWithJournal.
-            journal.finish(false);
+            // Synced when sync is set, as persistDirtyWithJournal does.
+            journal.finish(sync);
         }
 
         // persistDirty with a journal: the journal of the dirty elements and of the whole files given written first, then
@@ -1652,15 +1652,24 @@ namespace hnswlib
                 return;
             }
 
-            // The durability of Chroma 1.5.9, whose save flushes its files and syncs none: a kill keeps every save, which
-            // the page cache holds, whole or thrown away by the journal; a power loss or a crash of the system can lose
-            // the last saves or leave them torn, as in 1.5.9. A sync of each file under the write lock of the index made
-            // every write wait for the disk. The journal applied at load still syncs what it writes.
-            writePersistJournal(whole_files);
+            // Durable against a power loss and a snapshot of the disk, beyond Chroma 1.5.9, whose save syncs nothing: the
+            // journal and the folder that holds it and the files are synced before a file is touched, the files after
+            // they are written, and the journal is removed only then. A cut anywhere leaves the files of the save before
+            // with a journal torn, which the load discards, or a whole journal, which the load writes again: the index of
+            // the save before or of this one, never a mix. Distributed Chroma writes new files and publishes them whole;
+            // here that would copy the whole index at every save.
+            writePersistJournal(whole_files, true);
+            syncPersistDirectory(persist_location_);
+            size_t parent = persist_location_.find_last_of('/');
+            if (parent != std::string::npos && parent > 0)
+                syncPersistDirectory(persist_location_.substr(0, parent));
             persistDirty();
+            output_header_.flush();
+            for (size_t i = 0; i < 4; i++)
+                syncPersistedFile(persist_location_ + "/" + PERSIST_JOURNAL_FILES[i]);
             for (const auto &whole : whole_files)
-                writePersistedWholeFile(persist_location_ + "/" + whole.first, whole.second.data(), whole.second.size(), false);
-            removePersistJournal(persist_location_, false);
+                writePersistedWholeFile(persist_location_ + "/" + whole.first, whole.second.data(), whole.second.size(), true);
+            removePersistJournal(persist_location_, true);
         }
 
         constexpr size_t calculateHeaderSize() const {
