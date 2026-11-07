@@ -400,6 +400,59 @@ namespace hnswlib
         uint64_t records_ = 0;
     };
 
+    // A journal of the same layout as PersistJournalWriter's, built in memory: the journal of a save whose files are
+    // written later, without the lock of the index (takePersistJournal, persistJournalBytes).
+    class PersistJournalBuffer
+    {
+    public:
+        PersistJournalBuffer()
+        {
+            write(PERSIST_JOURNAL_MAGIC, sizeof(PERSIST_JOURNAL_MAGIC));
+            writePOD(PERSIST_JOURNAL_VERSION);
+        }
+
+        void record(uint8_t file, uint64_t offset, uint64_t size)
+        {
+            writePOD(file);
+            writePOD(offset);
+            writePOD(size);
+            records_++;
+        }
+
+        void wholeFile(const std::string &name, const char *data, size_t size)
+        {
+            record(PERSIST_JOURNAL_WHOLE_FILE, name.size(), name.size() + size);
+            write(name.data(), name.size());
+            write(data, size);
+        }
+
+        void write(const char *data, size_t size)
+        {
+            bytes_.append(data, size);
+            hash_.update(data, size);
+        }
+
+        template <typename T>
+        void writePOD(const T &value)
+        {
+            write((const char *)&value, sizeof(T));
+        }
+
+        // The end of the journal, and its bytes.
+        std::string finish()
+        {
+            writePOD(records_);
+            uint64_t hash = hash_.value();
+            write((const char *)&hash, sizeof(hash));
+            return std::move(bytes_);
+        }
+
+    private:
+        std::string bytes_;
+        Fnv1a64 hash_;
+        uint64_t records_ = 0;
+    };
+
     // Bytes of a journal, read and added to its hash; false at its end.
     inline bool readPersistJournal(std::istream &input, char *data, size_t size, Fnv1a64 &hash)
     {
@@ -547,6 +600,24 @@ namespace hnswlib
         return PersistJournalOutcome::Applied;
     }
 
+    // The second step of a save whose files are written without the lock of the index: the journal taken under that
+    // lock (takePersistJournal) written to the folder of the index in location and synced, with the folder and the
+    // folder above it, then written again to the files, which are synced, and removed, as at load
+    // (applyPersistJournal). A cut anywhere leaves the files of the save before with a journal torn, which the load
+    // discards, or a whole journal, which the load writes again: the index of the save before or of this one, as
+    // persistDirtyWithJournal. Needs no index: the caller lets one save at a time write the files of an index, and no
+    // load read them meanwhile.
+    inline void persistJournalBytes(const std::string &location, const char *data, size_t size)
+    {
+        writePersistedWholeFile(location + "/" + PERSIST_JOURNAL_FILE, data, size, true);
+        syncPersistDirectory(location);
+        size_t parent = location.find_last_of('/');
+        if (parent != std::string::npos && parent > 0)
+            syncPersistDirectory(location.substr(0, parent));
+        if (applyPersistJournal(location) != PersistJournalOutcome::Applied)
+            throw std::runtime_error("Cannot apply journal: " + location);
+    }
+
     template <typename dist_t>
     class HierarchicalNSW : public AlgorithmInterface<dist_t>
     {
@@ -614,6 +685,9 @@ namespace hnswlib
         std::string persist_location_;
         std::mutex elements_to_persist_lock_;    // lock for elements_to_persist_
         std::set<tableint> elements_to_persist_; // dirty elements to persist
+        // The dirty elements of the last journal taken (takePersistJournal), for restoreTakenElements after its write
+        // failed; under elements_to_persist_lock_ too.
+        std::set<tableint> taken_elements_;
         // File handles for persistence
         std::ofstream output_header_;              // output stream for header
         std::ofstream output_data_level0_;         // output stream for data level 0
@@ -1587,6 +1661,45 @@ namespace hnswlib
             }
 
             PersistJournalWriter journal(getPersistJournalLocation());
+            journalDirty(journal, whole_files);
+            // Synced when sync is set, as persistDirtyWithJournal does.
+            journal.finish(sync);
+        }
+
+        // The first step of a save whose files are written without the lock of the caller: the journal of the bytes
+        // that persistDirty would write now, in memory, and the dirty elements taken, so that the elements changed from
+        // now on go to the next save. Under the lock of the caller that writes the index, as persistDirty; the
+        // second step is persistJournalBytes, and restoreTakenElements gives the elements back when it failed.
+        std::string takePersistJournal(const std::vector<std::pair<std::string, std::string>> &whole_files = {})
+        {
+            if (!persist_on_write_)
+            {
+                throw std::runtime_error("takePersistJournal called for an index that is not set to persist on write");
+            }
+
+            PersistJournalBuffer journal;
+            journalDirty(journal, whole_files);
+            std::string bytes = journal.finish();
+            std::lock_guard<std::mutex> lock(elements_to_persist_lock_);
+            taken_elements_ = std::move(elements_to_persist_);
+            elements_to_persist_.clear();
+            return bytes;
+        }
+
+        // The dirty elements of the last journal taken given back, for the next save to write them, after the write of
+        // that journal failed. Under the lock of the caller that writes the index.
+        void restoreTakenElements()
+        {
+            std::lock_guard<std::mutex> lock(elements_to_persist_lock_);
+            elements_to_persist_.insert(taken_elements_.begin(), taken_elements_.end());
+            taken_elements_.clear();
+        }
+
+        // The records of the journal of the bytes that persistDirty would write now, to a PersistJournalWriter or a
+        // PersistJournalBuffer, without its end.
+        template <typename Journal>
+        void journalDirty(Journal &journal, const std::vector<std::pair<std::string, std::string>> &whole_files)
+        {
             std::ostringstream header;
             persistHeader(header);
             std::string header_bytes = header.str();
@@ -1637,8 +1750,6 @@ namespace hnswlib
             }
             for (const auto &whole : whole_files)
                 journal.wholeFile(whole.first, whole.second.data(), whole.second.size());
-            // Synced when sync is set, as persistDirtyWithJournal does.
-            journal.finish(sync);
         }
 
         // persistDirty with a journal: the journal of the dirty elements and of the whole files given written first, then

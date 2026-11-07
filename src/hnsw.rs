@@ -68,6 +68,16 @@ extern "C" {
         data: *const u8,
         size: usize,
     );
+    fn take_persist_journal_file(
+        index: *const HnswIndexPtrFFI,
+        name: *const c_char,
+        data: *const u8,
+        size: usize,
+    ) -> usize;
+    fn copy_taken_persist_journal(index: *const HnswIndexPtrFFI, out: *mut u8);
+    fn restore_taken_persist_elements(index: *const HnswIndexPtrFFI);
+    #[link_name = "persist_journal_bytes"]
+    fn persist_journal_bytes_ffi(path: *const c_char, data: *const u8, size: usize) -> c_int;
     #[link_name = "apply_persist_journal"]
     fn apply_persist_journal_ffi(path: *const c_char) -> c_int;
 
@@ -181,6 +191,21 @@ pub fn apply_persist_journal(path: &std::path::Path) -> Result<PersistJournal, H
         2 => PersistJournal::Discarded,
         _ => PersistJournal::None,
     })
+}
+
+/// The second step of a save whose files are written without the lock of the index: the journal taken from it
+/// (`HnswIndex::take_persist_journal_file`) written to the folder of the index in `path` and synced, with the folder
+/// and the folder above it, then written again to the files, which are synced, and removed. A cut anywhere leaves the
+/// index of the save before or of this one, as `save_with_journal_file`. The caller lets one save at a time write the
+/// files of an index, and no load read them meanwhile.
+pub fn persist_journal_bytes(path: &std::path::Path, journal: &[u8]) -> Result<(), HnswInitError> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| HnswInitError::InvalidPath("Invalid UTF-8 path".to_string()))?;
+    let path = CString::new(path).map_err(|e| HnswInitError::InvalidPath(e.to_string()))?;
+    unsafe { persist_journal_bytes_ffi(path.as_ptr(), journal.as_ptr(), journal.len()) };
+    read_and_return_hnsw_error(std::ptr::null())?;
+    Ok(())
 }
 
 /// A journal left in the folder of an index, as `persist_journals` reads it without applying it.
@@ -614,6 +639,33 @@ impl HnswIndex {
     pub fn write_persist_journal_file(&self, name: &str, bytes: &[u8]) -> Result<(), HnswError> {
         let name = CString::new(name).map_err(|e| HnswError::FFIException(e.to_string()))?;
         unsafe { write_persist_journal_file(self.ffi_ptr, name.as_ptr(), bytes.as_ptr(), bytes.len()) };
+        read_and_return_hnsw_error(self.ffi_ptr)?;
+        Ok(())
+    }
+
+    /// The first step of a save whose files are written without the lock of the index: the journal of what
+    /// `save_with_journal_file` would write now, in memory, and the dirty elements taken from the index, so that the
+    /// elements changed from now on go to the next save. Under the lock that writes the index, as a save; the second
+    /// step is `persist_journal_bytes`, and `restore_taken_elements` gives the elements back when it failed.
+    pub fn take_persist_journal_file(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<Vec<u8>, HnswError> {
+        let name = CString::new(name).map_err(|e| HnswError::FFIException(e.to_string()))?;
+        let size = unsafe {
+            take_persist_journal_file(self.ffi_ptr, name.as_ptr(), bytes.as_ptr(), bytes.len())
+        };
+        read_and_return_hnsw_error(self.ffi_ptr)?;
+        let mut journal = vec![0u8; size];
+        unsafe { copy_taken_persist_journal(self.ffi_ptr, journal.as_mut_ptr()) };
+        Ok(journal)
+    }
+
+    /// The dirty elements of the last journal taken (`take_persist_journal_file`) given back to the next save, after the
+    /// write of that journal failed. Under the lock that writes the index.
+    pub fn restore_taken_elements(&self) -> Result<(), HnswError> {
+        unsafe { restore_taken_persist_elements(self.ffi_ptr) };
         read_and_return_hnsw_error(self.ffi_ptr)?;
         Ok(())
     }
@@ -1457,6 +1509,100 @@ pub mod test {
         index.save_with_journal_file(ID_MAP, b"the map of the save").unwrap();
         assert_eq!(std::fs::read(dir.path().join(ID_MAP)).unwrap(), b"the map of the save");
         assert!(!dir.path().join(PERSIST_JOURNAL_FILE).exists());
+        index.close_fd();
+        drop(index);
+        assert_journal_fixture_saved(dir.path());
+    }
+
+    // A journal taken in memory is the journal that a save would write to the folder, byte for byte: what the load does
+    // with a journal left, whole, cut or damaged, it does with one taken.
+    #[test]
+    fn a_taken_journal_is_the_journal_of_a_save() {
+        let dir = tempdir().unwrap();
+        let index = journal_fixture(dir.path());
+        index
+            .write_persist_journal_file(ID_MAP, b"the map of the save")
+            .unwrap();
+        let written = std::fs::read(dir.path().join(PERSIST_JOURNAL_FILE)).unwrap();
+        let taken = index
+            .take_persist_journal_file(ID_MAP, b"the map of the save")
+            .unwrap();
+        assert_eq!(taken, written);
+    }
+
+    // A save whose files are written without the lock of the index: the journal taken, then the index changed in memory,
+    // as by the writes that go on, then the journal written. The files hold the index of the time of the take, with the
+    // whole file, and no journal is left.
+    #[test]
+    fn a_taken_journal_writes_the_index_of_its_take() {
+        let dir = tempdir().unwrap();
+        let mut index = journal_fixture(dir.path());
+        let journal = index
+            .take_persist_journal_file(ID_MAP, b"the map of the save")
+            .unwrap();
+        index.resize(400).unwrap();
+        for id in 121..=300 {
+            index.add(id, &journal_vector(id, 0)).unwrap();
+        }
+        for id in 11..=20 {
+            index.add(id, &journal_vector(id, 2)).unwrap();
+        }
+        persist_journal_bytes(dir.path(), &journal).unwrap();
+        assert!(!dir.path().join(PERSIST_JOURNAL_FILE).exists());
+        assert_eq!(
+            std::fs::read(dir.path().join(ID_MAP)).unwrap(),
+            b"the map of the save"
+        );
+        index.close_fd();
+        drop(index);
+        assert_journal_fixture_saved(dir.path());
+    }
+
+    // The elements changed after a take go to the next one: two saves without the lock give the index of the second.
+    #[test]
+    fn the_elements_changed_after_a_take_go_to_the_next_one() {
+        let dir = tempdir().unwrap();
+        let mut index = journal_fixture(dir.path());
+        let first = index.take_persist_journal_file(ID_MAP, b"first").unwrap();
+        index.resize(400).unwrap();
+        for id in 121..=300 {
+            index.add(id, &journal_vector(id, 0)).unwrap();
+        }
+        for id in 11..=20 {
+            index.add(id, &journal_vector(id, 2)).unwrap();
+        }
+        persist_journal_bytes(dir.path(), &first).unwrap();
+        let second = index.take_persist_journal_file(ID_MAP, b"second").unwrap();
+        persist_journal_bytes(dir.path(), &second).unwrap();
+        index.close_fd();
+        drop(index);
+        assert_eq!(std::fs::read(dir.path().join(ID_MAP)).unwrap(), b"second");
+        let loaded = reload_persistence_fixture(dir.path(), HnswDistanceFunction::Euclidean);
+        assert_eq!(loaded.len(), 300);
+        for id in 1..=300 {
+            let round = match id {
+                1..=10 => 1,
+                11..=20 => 2,
+                _ => 0,
+            };
+            assert_eq!(
+                loaded.get(id).unwrap().unwrap(),
+                journal_vector(id, round).to_vec()
+            );
+        }
+    }
+
+    // A journal taken whose write failed: its elements, given back, go to the next save, which writes the whole index.
+    #[test]
+    fn the_elements_of_a_failed_write_go_to_the_next_save() {
+        let dir = tempdir().unwrap();
+        let index = journal_fixture(dir.path());
+        drop(index.take_persist_journal_file(ID_MAP, b"lost").unwrap());
+        index.restore_taken_elements().unwrap();
+        let journal = index
+            .take_persist_journal_file(ID_MAP, b"the map of the save")
+            .unwrap();
+        persist_journal_bytes(dir.path(), &journal).unwrap();
         index.close_fd();
         drop(index);
         assert_journal_fixture_saved(dir.path());

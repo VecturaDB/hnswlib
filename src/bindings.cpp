@@ -171,6 +171,30 @@ public:
     appr_alg->writePersistJournal({{name, bytes}});
   }
 
+  // The journal of a save with a whole file of the caller, in memory, the dirty elements taken from the index: the first
+  // step of a save whose files are written without the lock of the index (hnswlib::persistJournalBytes). Kept here
+  // until the caller copies it (copy_taken_persist_journal).
+  std::string taken_journal;
+
+  void take_persist_journal_file(const std::string &name, const std::string &bytes)
+  {
+    if (!index_inited)
+    {
+      throw std::runtime_error("Index not inited");
+    }
+    taken_journal = appr_alg->takePersistJournal({{name, bytes}});
+  }
+
+  // The dirty elements of the last journal taken given back to the next save, after its write failed.
+  void restore_taken_persist_elements()
+  {
+    if (!index_inited)
+    {
+      throw std::runtime_error("Index not inited");
+    }
+    appr_alg->restoreTakenElements();
+  }
+
   void add_item(const data_t *data, const hnswlib::labeltype id, const bool replace_deleted = false)
   {
     if (!index_inited)
@@ -438,6 +462,64 @@ extern "C"
       return;
     }
     last_error.clear();
+  }
+
+  // Can throw std::exception. Returns the size of the journal taken, which the index keeps until
+  // copy_taken_persist_journal.
+  size_t take_persist_journal_file(Index<float> *index, const char *name, const char *data, size_t size)
+  {
+    try
+    {
+      index->take_persist_journal_file(name, std::string(data, size));
+    }
+    catch (std::exception &e)
+    {
+      last_error = e.what();
+      return 0;
+    }
+    last_error.clear();
+    return index->taken_journal.size();
+  }
+
+  // The journal taken copied to out, which holds its size, then released by the index.
+  void copy_taken_persist_journal(Index<float> *index, char *out)
+  {
+    if (!index->taken_journal.empty())
+      std::memcpy(out, index->taken_journal.data(), index->taken_journal.size());
+    std::string().swap(index->taken_journal);
+    last_error.clear();
+  }
+
+  // Can throw std::exception
+  void restore_taken_persist_elements(Index<float> *index)
+  {
+    try
+    {
+      index->restore_taken_persist_elements();
+    }
+    catch (std::exception &e)
+    {
+      last_error = e.what();
+      return;
+    }
+    last_error.clear();
+  }
+
+  // Can throw std::exception. Needs no index: the journal taken from one, written to the files of the index in path
+  // (hnswlib::persistJournalBytes). 0, or -1 with the error in last_error.
+  int persist_journal_bytes(const char *path, const char *data, size_t size)
+  {
+    try
+    {
+      hnswlib::persistJournalBytes(path, data, size);
+    }
+    catch (std::exception &e)
+    {
+      last_error = e.what();
+      return -1;
+    }
+    last_error.clear();
+    return 0;
   }
 
   // Can throw std::exception. Needs no index: it runs before the files of one are read. Returns a
