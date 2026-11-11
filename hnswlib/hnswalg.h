@@ -35,9 +35,145 @@
 #include <fcntl.h>
 #include <unistd.h>
 #endif
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 namespace hnswlib
 {
+    // The three buffers of an index that grow with it (the base layer, the lengths and the pointers to the upper layers)
+    // are mapped from the system on Linux, not taken from malloc. Once glibc has freed a block above its mmap threshold
+    // it raises the threshold and serves blocks of that size from its arenas, which keep the memory after the free; an
+    // index loaded or resized at every flush then leaves the arenas larger at each flush. A mapping goes back to the
+    // system at its free. Elsewhere the buffers stay with malloc.
+    namespace index_memory
+    {
+#if defined(__linux__)
+        // The length of the mapping, kept before the buffer; 64 bytes keep the buffer aligned as the mapping is.
+        constexpr size_t HEAD = 64;
+
+        inline size_t mappedLength(size_t bytes)
+        {
+            const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+            return (bytes + HEAD + page - 1) / page * page;
+        }
+
+        inline void *allocate(size_t bytes)
+        {
+            const size_t length = mappedLength(bytes);
+            void *base = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (base == MAP_FAILED)
+                return nullptr;
+            *(size_t *)base = length;
+            return (char *)base + HEAD;
+        }
+
+        inline void *reallocate(void *buffer, size_t bytes)
+        {
+            if (buffer == nullptr)
+                return allocate(bytes);
+            char *base = (char *)buffer - HEAD;
+            const size_t length = mappedLength(bytes);
+            void *moved = mremap(base, *(size_t *)base, length, MREMAP_MAYMOVE);
+            if (moved == MAP_FAILED)
+                return nullptr;
+            *(size_t *)moved = length;
+            return (char *)moved + HEAD;
+        }
+
+        inline void release(void *buffer)
+        {
+            if (buffer == nullptr)
+                return;
+            char *base = (char *)buffer - HEAD;
+            munmap(base, *(size_t *)base);
+        }
+#else
+        inline void *allocate(size_t bytes) { return malloc(bytes); }
+        inline void *reallocate(void *buffer, size_t bytes) { return realloc(buffer, bytes); }
+        inline void release(void *buffer) { free(buffer); }
+#endif
+    }
+
+    // Bytes that grow, kept in index_memory: the journal of a save built in memory, which can be as large as the index.
+    class IndexBytes
+    {
+    public:
+        IndexBytes() {}
+        IndexBytes(const IndexBytes &) = delete;
+        IndexBytes &operator=(const IndexBytes &) = delete;
+
+        IndexBytes(IndexBytes &&other) : data_(other.data_), size_(other.size_), capacity_(other.capacity_)
+        {
+            other.data_ = nullptr;
+            other.size_ = 0;
+            other.capacity_ = 0;
+        }
+
+        IndexBytes &operator=(IndexBytes &&other)
+        {
+            if (this != &other)
+            {
+                index_memory::release(data_);
+                data_ = other.data_;
+                size_ = other.size_;
+                capacity_ = other.capacity_;
+                other.data_ = nullptr;
+                other.size_ = 0;
+                other.capacity_ = 0;
+            }
+            return *this;
+        }
+
+        ~IndexBytes() { index_memory::release(data_); }
+
+        void reserve(size_t capacity)
+        {
+            if (capacity <= capacity_)
+                return;
+            char *grown = (char *)index_memory::reallocate(data_, capacity);
+            if (grown == nullptr)
+                throw std::runtime_error("Not enough memory for the journal of a save");
+            data_ = grown;
+            capacity_ = capacity;
+        }
+
+        void append(const char *data, size_t size)
+        {
+            if (size == 0)
+                return;
+            if (size > capacity_ - size_)
+                reserve(std::max(size_ + size, 2 * capacity_));
+            std::memcpy(data_ + size_, data, size);
+            size_ += size;
+        }
+
+        const char *data() const { return data_; }
+        size_t size() const { return size_; }
+        bool empty() const { return size_ == 0; }
+
+    private:
+        char *data_ = nullptr;
+        size_t size_ = 0;
+        size_t capacity_ = 0;
+    };
+
+    // A whole file of a save, as its caller holds it: its bytes are copied once, into the journal.
+    struct PersistWholeFile
+    {
+        std::string name;
+        const char *data;
+        size_t size;
+    };
+
+    inline std::vector<PersistWholeFile> persistWholeFiles(const std::vector<std::pair<std::string, std::string>> &whole_files)
+    {
+        std::vector<PersistWholeFile> files;
+        for (const auto &whole : whole_files)
+            files.push_back(PersistWholeFile{whole.first, whole.second.data(), whole.second.size()});
+        return files;
+    }
+
     #define HEADER_FIELDS(ACTION) \
     ACTION(PERSISTENCE_VERSION) \
     ACTION(offsetLevel0_) \
@@ -438,8 +574,14 @@ namespace hnswlib
             write((const char *)&value, sizeof(T));
         }
 
+        // Room for records of this many bytes and for the end, so that the journal is allocated once.
+        void reserve(size_t records)
+        {
+            bytes_.reserve(bytes_.size() + records + sizeof(records_) + sizeof(uint64_t));
+        }
+
         // The end of the journal, and its bytes.
-        std::string finish()
+        IndexBytes finish()
         {
             writePOD(records_);
             uint64_t hash = hash_.value();
@@ -448,9 +590,35 @@ namespace hnswlib
         }
 
     private:
-        std::string bytes_;
+        IndexBytes bytes_;
         Fnv1a64 hash_;
         uint64_t records_ = 0;
+    };
+
+    // The bytes of the records a journal would hold, counted without writing them.
+    class PersistJournalLength
+    {
+    public:
+        void record(uint8_t file, uint64_t offset, uint64_t size)
+        {
+            size_ += sizeof(file) + sizeof(offset) + sizeof(size);
+        }
+
+        void wholeFile(const std::string &name, const char *data, size_t size)
+        {
+            record(PERSIST_JOURNAL_WHOLE_FILE, name.size(), name.size() + size);
+            size_ += name.size() + size;
+        }
+
+        void write(const char *data, size_t size) { size_ += size; }
+
+        template <typename T>
+        void writePOD(const T &value) { size_ += sizeof(T); }
+
+        size_t size() const { return size_; }
+
+    private:
+        size_t size_ = 0;
     };
 
     // Bytes of a journal, read and added to its hash; false at its end.
@@ -776,11 +944,11 @@ namespace hnswlib
             label_offset_ = size_links_level0_ + data_size_;
             offsetLevel0_ = 0;
 
-            data_level0_memory_ = (char *)malloc(max_elements_ * size_data_per_element_);
+            data_level0_memory_ = (char *)index_memory::allocate(max_elements_ * size_data_per_element_);
             if (data_level0_memory_ == nullptr)
                 throw std::runtime_error("Not enough memory");
 
-            length_memory_ = (char *)malloc(max_elements_ * sizeof(float));
+            length_memory_ = (char *)index_memory::allocate(max_elements_ * sizeof(float));
             if (length_memory_ == nullptr)
                 throw std::runtime_error("Not enough memory");
 
@@ -792,7 +960,7 @@ namespace hnswlib
             enterpoint_node_ = -1;
             maxlevel_ = -1;
 
-            linkLists_ = (char **)malloc(sizeof(void *) * max_elements_);
+            linkLists_ = (char **)index_memory::allocate(sizeof(void *) * max_elements_);
             if (linkLists_ == nullptr)
                 throw std::runtime_error("Not enough memory: HierarchicalNSW failed to allocate linklists");
             size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
@@ -811,14 +979,14 @@ namespace hnswlib
 
         ~HierarchicalNSW()
         {
-            free(data_level0_memory_);
+            index_memory::release(data_level0_memory_);
             for (tableint i = 0; i < cur_element_count; i++)
             {
                 if (element_levels_[i] > 0)
                     free(linkLists_[i]);
             }
-            free(linkLists_);
-            free(length_memory_);
+            index_memory::release(linkLists_);
+            index_memory::release(length_memory_);
             delete visited_list_pool_;
             closePersistentIndex();
         }
@@ -1373,19 +1541,19 @@ namespace hnswlib
             std::vector<std::mutex>(new_max_elements).swap(link_list_locks_);
 
             // Reallocate base layer
-            char *data_level0_memory_new = (char *)realloc(data_level0_memory_, new_max_elements * size_data_per_element_);
+            char *data_level0_memory_new = (char *)index_memory::reallocate(data_level0_memory_, new_max_elements * size_data_per_element_);
             if (data_level0_memory_new == nullptr)
                 throw std::runtime_error("Not enough memory: resizeIndex failed to allocate base layer");
             data_level0_memory_ = data_level0_memory_new;
 
             // Reallocate length memory
-            char *length_memory_new = (char *)realloc(length_memory_, new_max_elements * sizeof(float));
+            char *length_memory_new = (char *)index_memory::reallocate(length_memory_, new_max_elements * sizeof(float));
             if (length_memory_new == nullptr)
                 throw std::runtime_error("Not enough memory: resizeIndex failed to allocate length memory");
             length_memory_ = length_memory_new;
 
             // Reallocate all other layers
-            char **linkLists_new = (char **)realloc(linkLists_, sizeof(void *) * new_max_elements);
+            char **linkLists_new = (char **)index_memory::reallocate(linkLists_, sizeof(void *) * new_max_elements);
             if (linkLists_new == nullptr)
                 throw std::runtime_error("Not enough memory: resizeIndex failed to allocate other layers");
             linkLists_ = linkLists_new;
@@ -1661,7 +1829,7 @@ namespace hnswlib
             }
 
             PersistJournalWriter journal(getPersistJournalLocation());
-            journalDirty(journal, whole_files);
+            journalDirty(journal, persistWholeFiles(whole_files));
             // Synced when sync is set, as persistDirtyWithJournal does.
             journal.finish(sync);
         }
@@ -1670,16 +1838,24 @@ namespace hnswlib
         // that persistDirty would write now, in memory, and the dirty elements taken, so that the elements changed from
         // now on go to the next save. Under the lock of the caller that writes the index, as persistDirty; the
         // second step is persistJournalBytes, and restoreTakenElements gives the elements back when it failed.
-        std::string takePersistJournal(const std::vector<std::pair<std::string, std::string>> &whole_files = {})
+        IndexBytes takePersistJournal(const std::vector<std::pair<std::string, std::string>> &whole_files = {})
+        {
+            return takePersistJournal(persistWholeFiles(whole_files));
+        }
+
+        IndexBytes takePersistJournal(const std::vector<PersistWholeFile> &whole_files)
         {
             if (!persist_on_write_)
             {
                 throw std::runtime_error("takePersistJournal called for an index that is not set to persist on write");
             }
 
+            PersistJournalLength length;
+            journalDirty(length, whole_files);
             PersistJournalBuffer journal;
+            journal.reserve(length.size());
             journalDirty(journal, whole_files);
-            std::string bytes = journal.finish();
+            IndexBytes bytes = journal.finish();
             std::lock_guard<std::mutex> lock(elements_to_persist_lock_);
             taken_elements_ = std::move(elements_to_persist_);
             elements_to_persist_.clear();
@@ -1698,7 +1874,7 @@ namespace hnswlib
         // The records of the journal of the bytes that persistDirty would write now, to a PersistJournalWriter or a
         // PersistJournalBuffer, without its end.
         template <typename Journal>
-        void journalDirty(Journal &journal, const std::vector<std::pair<std::string, std::string>> &whole_files)
+        void journalDirty(Journal &journal, const std::vector<PersistWholeFile> &whole_files)
         {
             std::ostringstream header;
             persistHeader(header);
@@ -1749,7 +1925,7 @@ namespace hnswlib
                 }
             }
             for (const auto &whole : whole_files)
-                journal.wholeFile(whole.first, whole.second.data(), whole.second.size());
+                journal.wholeFile(whole.name, whole.data, whole.size);
         }
 
         // persistDirty with a journal: the journal of the dirty elements and of the whole files given written first, then
@@ -1923,7 +2099,7 @@ namespace hnswlib
             if (!input_data_level0.good())
                 throw std::runtime_error("Data level0 stream is not in good state");
 
-            data_level0_memory_ = (char *)malloc(max_elements * size_data_per_element_);
+            data_level0_memory_ = (char *)index_memory::allocate(max_elements * size_data_per_element_);
             if (data_level0_memory_ == nullptr)
                 throw std::runtime_error("Not enough memory: loadPersistedIndex failed to allocate level0");
             input_data_level0.read(data_level0_memory_, max_elements * size_data_per_element_);
@@ -1932,7 +2108,7 @@ namespace hnswlib
             if (!input_length.good())
                 throw std::runtime_error("Length stream is not in good state");
 
-            length_memory_ = (char *)malloc(max_elements * sizeof(float));
+            length_memory_ = (char *)index_memory::allocate(max_elements * sizeof(float));
             if (length_memory_ == nullptr)
                 throw std::runtime_error("Not enough memory: loadPersistedIndex failed to allocate length_memory_");
             input_length.read(length_memory_, max_elements * sizeof(float));
@@ -2008,7 +2184,7 @@ namespace hnswlib
 
             visited_list_pool_ = new VisitedListPool(1, max_elements_);
 
-            linkLists_ = (char **)malloc(sizeof(void *) * max_elements_);
+            linkLists_ = (char **)index_memory::allocate(sizeof(void *) * max_elements_);
             if (linkLists_ == nullptr)
                 throw std::runtime_error("Not enough memory: loadPersistedIndex failed to allocate linklists");
             element_levels_ = std::vector<int>(max_elements_);
@@ -2113,12 +2289,12 @@ namespace hnswlib
 
             input.seekg(pos, input.beg);
 
-            data_level0_memory_ = (char *)malloc(max_elements * size_data_per_element_);
+            data_level0_memory_ = (char *)index_memory::allocate(max_elements * size_data_per_element_);
             if (data_level0_memory_ == nullptr)
                 throw std::runtime_error("Not enough memory: loadIndex failed to allocate level0");
             input.read(data_level0_memory_, cur_element_count * size_data_per_element_);
 
-            length_memory_ = (char *)malloc(max_elements * sizeof(float));
+            length_memory_ = (char *)index_memory::allocate(max_elements * sizeof(float));
             if (length_memory_ == nullptr)
                 throw std::runtime_error("Not enough memory: loadIndex failed to allocate length_memory_");
             input.read(length_memory_, cur_element_count * sizeof(float));

@@ -84,6 +84,7 @@ jobs:
           ./persistent_test
           ./replace_links_test
           ./update_links_test
+          ./persist_journal_memory_test
         shell: bash
 
   test_rust:
