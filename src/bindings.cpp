@@ -174,15 +174,17 @@ public:
   // The journal of a save with a whole file of the caller, in memory, the dirty elements taken from the index: the first
   // step of a save whose files are written without the lock of the index (hnswlib::persistJournalBytes). Kept here
   // until the caller copies it (copy_taken_persist_journal).
-  std::string taken_journal;
+  hnswlib::IndexBytes taken_journal;
 
-  void take_persist_journal_file(const std::string &name, const std::string &bytes)
+  // The bytes of the whole file are the caller's, read during the call.
+  void take_persist_journal_file(const std::string &name, const char *data, size_t size)
   {
     if (!index_inited)
     {
       throw std::runtime_error("Index not inited");
     }
-    taken_journal = appr_alg->takePersistJournal({{name, bytes}});
+    taken_journal = appr_alg->takePersistJournal(
+        std::vector<hnswlib::PersistWholeFile>{hnswlib::PersistWholeFile{name, data, size}});
   }
 
   // The dirty elements of the last journal taken given back to the next save, after its write failed.
@@ -470,7 +472,7 @@ extern "C"
   {
     try
     {
-      index->take_persist_journal_file(name, std::string(data, size));
+      index->take_persist_journal_file(name, data, size);
     }
     catch (std::exception &e)
     {
@@ -486,7 +488,7 @@ extern "C"
   {
     if (!index->taken_journal.empty())
       std::memcpy(out, index->taken_journal.data(), index->taken_journal.size());
-    std::string().swap(index->taken_journal);
+    index->taken_journal = hnswlib::IndexBytes();
     last_error.clear();
   }
 

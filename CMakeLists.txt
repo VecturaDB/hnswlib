@@ -66,6 +66,9 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_executable(update_links_test tests/cpp/update_links_test.cpp)
     target_link_libraries(update_links_test hnswlib)
 
+    add_executable(persist_journal_memory_test tests/cpp/persist_journal_memory_test.cpp)
+    target_link_libraries(persist_journal_memory_test hnswlib)
+
     add_executable(api_tests tests/cpp/api_test.cpp)
     target_link_libraries(api_tests hnswlib)
 

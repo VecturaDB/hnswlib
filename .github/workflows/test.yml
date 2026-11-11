@@ -5,9 +5,11 @@ on:
   push:
     branches:
       - master
+      - vecturadb
   pull_request:
     branches:
       - master
+      - vecturadb
 
 jobs:
   test_python:
@@ -15,7 +17,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.8", "3.9", "3.10"]
+        python-version: ["3.10", "3.11"]
     steps:
       - uses: actions/checkout@v3
       - uses: actions/setup-python@v4
@@ -84,6 +86,7 @@ jobs:
           ./persistent_test
           ./replace_links_test
           ./update_links_test
+          ./persist_journal_memory_test
         shell: bash
 
   test_rust:
